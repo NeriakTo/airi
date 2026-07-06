@@ -24,6 +24,7 @@ import {
 import { WidgetStage } from '@proj-airi/stage-ui/components/scenes'
 import { useAudioRecorder } from '@proj-airi/stage-ui/composables/audio/audio-recorder'
 import { useCanvasPixelIsTransparentAtPoint } from '@proj-airi/stage-ui/composables/canvas-alpha'
+import { useMeowVoiceRouter } from '@proj-airi/stage-ui/composables/meowvoice/agent-router'
 import { useVAD } from '@proj-airi/stage-ui/stores/ai/models/vad'
 import { useHearingSpeechInputPipeline } from '@proj-airi/stage-ui/stores/modules/hearing'
 import { useOnboardingStore } from '@proj-airi/stage-ui/stores/onboarding'
@@ -241,6 +242,7 @@ const hearingPipeline = useHearingSpeechInputPipeline()
 const { transcribeForRecording, transcribeForMediaStream, stopStreamingTranscription } = hearingPipeline
 const { supportsStreamInput } = storeToRefs(hearingPipeline)
 const chatSyncStore = useChatSyncStore()
+const meowVoiceRouter = useMeowVoiceRouter()
 const shouldUseStreamInput = computed(() => supportsStreamInput.value && !!stream.value)
 
 const { init: initVAD, dispose: disposeVAD, start: startVAD, loaded: vadLoaded } = useVAD(workletUrl, {
@@ -269,12 +271,20 @@ function handleStreamingSentenceEnd(delta: string) {
     return
   }
 
+  const { routedText, switched } = meowVoiceRouter.routeText(finalText)
+
   postCaption({ type: 'caption-speaker', text: finalText })
+
+  if (switched)
+    console.info('[MeowVoice] Agent switched to:', meowVoiceRouter.activeAgentName.value)
+
+  if (!routedText)
+    return
 
   void (async () => {
     try {
-      console.info('[Main Page] Sending transcription to chat:', finalText)
-      await chatSyncStore.requestIngest({ text: finalText })
+      console.info('[Main Page] Sending transcription to chat:', routedText)
+      await chatSyncStore.requestIngest({ text: routedText })
     }
     catch (err) {
       console.error('[Main Page] Failed to send chat from voice:', err)
@@ -375,11 +385,19 @@ async function startAudioInteraction() {
         if (!text || !text.trim())
           return
 
+        const { routedText, switched } = meowVoiceRouter.routeText(text)
+
         // Update caption overlay speaker text via BroadcastChannel
         postCaption({ type: 'caption-speaker', text })
 
+        if (switched)
+          console.info('[MeowVoice] Agent switched to:', meowVoiceRouter.activeAgentName.value)
+
+        if (!routedText)
+          return
+
         try {
-          await chatSyncStore.requestIngest({ text })
+          await chatSyncStore.requestIngest({ text: routedText })
         }
         catch (err) {
           console.error('Failed to send chat from voice:', err)

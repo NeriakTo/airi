@@ -1,0 +1,455 @@
+<title>MeowVoice 語音測試</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<style>
+  @font-face {
+    font-family: 'SystemUI';
+    src: local('SF Pro Text'), local('Segoe UI'), local('system-ui');
+  }
+
+  :root {
+    --bg: #f6f8fa;
+    --surface: #ffffff;
+    --text: #1a2332;
+    --text-muted: #5a6a7e;
+    --cyan: #1aafa0;
+    --cyan-soft: #d5f0ed;
+    --cyan-glow: rgba(26, 175, 160, 0.12);
+    --border: #dfe4ea;
+    --red: #d94848;
+    --green: #2ea86f;
+    --radius: 10px;
+    --font: 'SystemUI', 'Segoe UI', system-ui, -apple-system, sans-serif;
+    --mono: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111820;
+      --surface: #1a2332;
+      --text: #e2e8f0;
+      --text-muted: #8a9ab5;
+      --cyan-soft: rgba(26, 175, 160, 0.15);
+      --cyan-glow: rgba(26, 175, 160, 0.08);
+      --border: #2a3545;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #111820;
+    --surface: #1a2332;
+    --text: #e2e8f0;
+    --text-muted: #8a9ab5;
+    --cyan-soft: rgba(26, 175, 160, 0.15);
+    --cyan-glow: rgba(26, 175, 160, 0.08);
+    --border: #2a3545;
+  }
+  :root[data-theme="light"] {
+    --bg: #f6f8fa;
+    --surface: #ffffff;
+    --text: #1a2332;
+    --text-muted: #5a6a7e;
+    --cyan-soft: #d5f0ed;
+    --cyan-glow: rgba(26, 175, 160, 0.12);
+    --border: #dfe4ea;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: var(--font);
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 2rem 1rem;
+  }
+
+  .container {
+    width: 100%;
+    max-width: 520px;
+    display: flex;
+    flex-direction: column;
+    gap: 1.25rem;
+  }
+
+  header {
+    text-align: center;
+    padding-bottom: 0.5rem;
+  }
+
+  header h1 {
+    font-size: 1.35rem;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+  }
+
+  header h1 .dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--red);
+    display: inline-block;
+    transition: background 0.3s;
+  }
+
+  header h1 .dot.online { background: var(--green); }
+
+  .status-line {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    margin-top: 0.35rem;
+    font-family: var(--mono);
+  }
+
+  .config {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1rem 1.15rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+  }
+
+  .config label {
+    font-size: 0.75rem;
+    font-weight: 500;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+
+  .config input {
+    font-family: var(--mono);
+    font-size: 0.85rem;
+    padding: 0.5rem 0.65rem;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+    color: var(--text);
+    outline: none;
+    transition: border-color 0.15s;
+  }
+
+  .config input:focus { border-color: var(--cyan); }
+
+  .record-area {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 1rem;
+    padding: 1.5rem 0;
+  }
+
+  .mic-btn {
+    width: 80px; height: 80px;
+    border-radius: 50%;
+    border: 3px solid var(--border);
+    background: var(--surface);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s;
+    position: relative;
+  }
+
+  .mic-btn:hover { border-color: var(--cyan); }
+
+  .mic-btn.recording {
+    border-color: var(--red);
+    background: rgba(217, 72, 72, 0.08);
+    animation: pulse 1.5s ease-in-out infinite;
+  }
+
+  .mic-btn svg { width: 32px; height: 32px; fill: var(--text-muted); transition: fill 0.2s; }
+  .mic-btn:hover svg { fill: var(--cyan); }
+  .mic-btn.recording svg { fill: var(--red); }
+
+  @keyframes pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(217, 72, 72, 0.25); }
+    50% { box-shadow: 0 0 0 12px rgba(217, 72, 72, 0); }
+  }
+
+  .mic-label {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+  }
+
+  .log {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    max-height: 360px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .log-entry {
+    padding: 0.6rem 1rem;
+    font-size: 0.82rem;
+    line-height: 1.5;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    gap: 0.5rem;
+    align-items: flex-start;
+  }
+
+  .log-entry:last-child { border-bottom: none; }
+
+  .log-entry .tag {
+    font-family: var(--mono);
+    font-size: 0.7rem;
+    font-weight: 600;
+    padding: 0.1rem 0.4rem;
+    border-radius: 4px;
+    white-space: nowrap;
+    flex-shrink: 0;
+    margin-top: 0.1rem;
+  }
+
+  .tag-stt { background: var(--cyan-soft); color: var(--cyan); }
+  .tag-tts { background: rgba(108, 92, 231, 0.12); color: #6c5ce7; }
+  .tag-err { background: rgba(217, 72, 72, 0.1); color: var(--red); }
+  .tag-sys { background: rgba(90, 106, 126, 0.1); color: var(--text-muted); }
+
+  .log-entry .msg { word-break: break-word; }
+
+  .tts-test {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1rem 1.15rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+  }
+
+  .tts-row {
+    display: flex;
+    gap: 0.5rem;
+  }
+
+  .tts-row input {
+    flex: 1;
+    font-family: var(--font);
+    font-size: 0.85rem;
+    padding: 0.5rem 0.65rem;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+    color: var(--text);
+    outline: none;
+  }
+
+  .tts-row input:focus { border-color: var(--cyan); }
+
+  button.action {
+    font-family: var(--font);
+    font-size: 0.82rem;
+    font-weight: 500;
+    padding: 0.5rem 1rem;
+    border: none;
+    border-radius: 6px;
+    background: var(--cyan);
+    color: #fff;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: opacity 0.15s;
+  }
+
+  button.action:hover { opacity: 0.85; }
+  button.action:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  audio { width: 100%; height: 36px; border-radius: 6px; margin-top: 0.3rem; }
+</style>
+
+<div class="container">
+  <header>
+    <h1><span class="dot" id="statusDot"></span> MeowVoice 語音測試</h1>
+    <div class="status-line" id="statusLine">connecting...</div>
+  </header>
+
+  <div class="config">
+    <label>Audio Server</label>
+    <input type="text" id="serverUrl" value="" spellcheck="false" placeholder="留空 = 同 origin">
+  </div>
+
+  <div class="tts-test">
+    <label style="font-size:0.75rem;font-weight:500;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.06em">TTS 測試</label>
+    <div class="tts-row">
+      <input type="text" id="ttsInput" value="你好，我是青喵，很高興認識你" placeholder="輸入要合成的文字">
+      <button class="action" id="ttsBtn" onclick="testTTS()">合成</button>
+    </div>
+    <audio id="ttsAudio" controls style="display:none"></audio>
+  </div>
+
+  <div class="record-area">
+    <button class="mic-btn" id="micBtn" onclick="toggleRecord()">
+      <svg viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm-1-9c0-.55.45-1 1-1s1 .45 1 1v6c0 .55-.45 1-1 1s-1-.45-1-1V5z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>
+    </button>
+    <span class="mic-label" id="micLabel">點擊開始錄音</span>
+  </div>
+
+  <div class="log" id="log"></div>
+</div>
+
+<script>
+  const serverInput = document.getElementById('serverUrl');
+  const statusDot = document.getElementById('statusDot');
+  const statusLine = document.getElementById('statusLine');
+  const micBtn = document.getElementById('micBtn');
+  const micLabel = document.getElementById('micLabel');
+  const logEl = document.getElementById('log');
+  const ttsAudio = document.getElementById('ttsAudio');
+
+  let mediaRecorder = null;
+  let chunks = [];
+  let recording = false;
+
+  function getServer() { return serverInput.value.trim().replace(/\/+$/, '') || window.location.origin; }
+
+  function log(tag, msg) {
+    const entry = document.createElement('div');
+    entry.className = 'log-entry';
+    const tagClass = { STT: 'tag-stt', TTS: 'tag-tts', ERR: 'tag-err', SYS: 'tag-sys' }[tag] || 'tag-sys';
+    entry.innerHTML = `<span class="tag ${tagClass}">${tag}</span><span class="msg">${msg}</span>`;
+    logEl.prepend(entry);
+  }
+
+  async function checkHealth() {
+    try {
+      const res = await fetch(getServer() + '/health');
+      const data = await res.json();
+      statusDot.classList.add('online');
+      statusLine.textContent = `${data.tts_model} · ${data.stt_model}`;
+      log('SYS', `已連線 ${getServer()}`);
+    } catch (e) {
+      statusDot.classList.remove('online');
+      statusLine.textContent = '無法連線';
+      log('ERR', `連線失敗: ${e.message}`);
+    }
+  }
+
+  async function testTTS() {
+    const text = document.getElementById('ttsInput').value.trim();
+    if (!text) return;
+    const btn = document.getElementById('ttsBtn');
+    btn.disabled = true;
+    btn.textContent = '合成中…';
+    log('TTS', `合成: "${text}"`);
+
+    try {
+      const res = await fetch(getServer() + '/v1/audio/speech', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ input: text, voice: 'Chelsie', model: 'qwen3-tts' }),
+      });
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      ttsAudio.src = url;
+      ttsAudio.style.display = 'block';
+      ttsAudio.play();
+      log('TTS', `播放中 (${(blob.size / 1024).toFixed(0)} KB)`);
+    } catch (e) {
+      log('ERR', `TTS 失敗: ${e.message}`);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '合成';
+    }
+  }
+
+  async function toggleRecord() {
+    if (recording) {
+      mediaRecorder.stop();
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
+      chunks = [];
+
+      mediaRecorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+
+      mediaRecorder.onstop = async () => {
+        recording = false;
+        micBtn.classList.remove('recording');
+        micLabel.textContent = '處理中…';
+        stream.getTracks().forEach(t => t.stop());
+
+        const webmBlob = new Blob(chunks, { type: 'audio/webm' });
+
+        try {
+          const arrayBuf = await webmBlob.arrayBuffer();
+          const audioCtx = new AudioContext();
+          const decoded = await audioCtx.decodeAudioData(arrayBuf);
+          const nativeSR = decoded.sampleRate;
+          const pcm = decoded.getChannelData(0);
+
+          const wavBuf = encodeWAV(pcm, nativeSR);
+          const wavBlob = new Blob([wavBuf], { type: 'audio/wav' });
+
+          log('STT', `錄音完成 (${(wavBlob.size / 1024).toFixed(0)} KB, ${nativeSR}Hz, ${(pcm.length/nativeSR).toFixed(1)}s)，辨識中…`);
+
+          const form = new FormData();
+          form.append('file', wavBlob, 'recording.wav');
+
+          const res = await fetch(getServer() + '/v1/audio/transcriptions?model=whisper-large-v3-turbo&language=zh', {
+            method: 'POST',
+            body: form,
+          });
+          const data = await res.json();
+          log('STT', `辨識結果: "${data.text}"`);
+          audioCtx.close();
+        } catch (e) {
+          log('ERR', `STT 失敗: ${e.message}`);
+        }
+
+        micLabel.textContent = '點擊開始錄音';
+      };
+
+      mediaRecorder.start();
+      recording = true;
+      micBtn.classList.add('recording');
+      micLabel.textContent = '錄音中… 再點一下停止';
+      log('SYS', '開始錄音');
+    } catch (e) {
+      log('ERR', `麥克風存取失敗: ${e.message}`);
+    }
+  }
+
+  function encodeWAV(samples, sampleRate) {
+    const buffer = new ArrayBuffer(44 + samples.length * 2);
+    const view = new DataView(buffer);
+    function writeStr(offset, str) { for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i)); }
+    writeStr(0, 'RIFF');
+    view.setUint32(4, 36 + samples.length * 2, true);
+    writeStr(8, 'WAVE');
+    writeStr(12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    writeStr(36, 'data');
+    view.setUint32(40, samples.length * 2, true);
+    for (let i = 0; i < samples.length; i++) {
+      const s = Math.max(-1, Math.min(1, samples[i]));
+      view.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+    }
+    return buffer;
+  }
+
+  serverInput.addEventListener('change', checkHealth);
+  checkHealth();
+</script>

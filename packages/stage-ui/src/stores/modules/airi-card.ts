@@ -9,6 +9,7 @@ import { useI18n } from 'vue-i18n'
 
 import SystemPromptV2 from '../../constants/prompts/system-v2'
 
+import { CYANMEOW_CARD } from '../../constants/cards/cyanmeow'
 import { DEFAULT_ARTISTRY_WIDGET_SPAWNING_PROMPT } from '../../constants/prompts/character-defaults'
 import { capturePosthogEvent } from '../analytics/posthog'
 import { useSettingsStageModel } from '../settings/stage-model'
@@ -334,6 +335,8 @@ export const useAiriCardStore = defineStore('airi-card', () => {
         t('base.prompt.suffix'),
       ).content,
     }))
+    if (!cards.value.has('cyanmeow'))
+      cards.value.set('cyanmeow', newAiriCard(CYANMEOW_CARD))
     if (!activeCardId.value)
       activeCardId.value = 'default'
   }

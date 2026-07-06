@@ -442,6 +442,63 @@ export const useProvidersStore = defineStore('providers', () => {
         },
       },
     }),
+    'meowvoice-mlx-speech': buildOpenAICompatibleProvider({
+      id: 'meowvoice-mlx-speech',
+      name: 'MeowVoice MLX (TTS)',
+      nameKey: 'settings.pages.providers.provider.meowvoice-mlx-speech.title',
+      descriptionKey: 'settings.pages.providers.provider.meowvoice-mlx-speech.description',
+      icon: 'i-carbon:microphone',
+      description: 'Qwen3-TTS 1.7B via local MLX audio server',
+      category: 'speech',
+      tasks: ['text-to-speech', 'tts'],
+      defaultBaseUrl: 'http://127.0.0.1:8400/v1/',
+      isAvailableBy: isStageTamagotchi,
+      creator: createOpenAI,
+      validation: [],
+      validators: {
+        chatPingCheckAvailable: false,
+        validateProviderConfig: () => ({
+          errors: [],
+          reason: '',
+          valid: true,
+        }),
+      },
+      capabilities: {
+        listModels: async () => [
+          { id: 'qwen3-tts', name: 'Qwen3-TTS 1.7B', provider: 'meowvoice-mlx-speech', description: 'Local MLX TTS', contextLength: 0, deprecated: false },
+        ],
+        listVoices: async () => [
+          { name: 'Chelsie', id: 'Chelsie', provider: 'meowvoice-mlx-speech', languages: [{ code: 'zh', title: 'Chinese' }] },
+        ],
+      },
+    }),
+    'meowvoice-mlx-transcription': buildOpenAICompatibleProvider({
+      id: 'meowvoice-mlx-transcription',
+      name: 'MeowVoice MLX (STT)',
+      nameKey: 'settings.pages.providers.provider.meowvoice-mlx-transcription.title',
+      descriptionKey: 'settings.pages.providers.provider.meowvoice-mlx-transcription.description',
+      icon: 'i-carbon:text-annotation-toggle',
+      description: 'mlx-whisper large-v3-turbo via local MLX audio server',
+      category: 'transcription',
+      tasks: ['speech-to-text', 'automatic-speech-recognition', 'asr', 'stt'],
+      defaultBaseUrl: 'http://127.0.0.1:8400/v1/',
+      isAvailableBy: isStageTamagotchi,
+      creator: createOpenAI,
+      validation: [],
+      validators: {
+        chatPingCheckAvailable: false,
+        validateProviderConfig: () => ({
+          errors: [],
+          reason: '',
+          valid: true,
+        }),
+      },
+      capabilities: {
+        listModels: async () => [
+          { id: 'whisper-large-v3-turbo', name: 'Whisper Large V3 Turbo', provider: 'meowvoice-mlx-transcription', description: 'Local MLX STT', contextLength: 0, deprecated: false },
+        ],
+      },
+    }),
     'browser-local-audio-speech': buildOpenAICompatibleProvider({
       id: 'browser-local-audio-speech',
       name: 'Browser (Local)',
