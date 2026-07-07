@@ -678,9 +678,12 @@ class VoiceReplyCallback(BaseModel):
     runtime_id: str = ""
 
 
+_pending_replies: dict[str, tuple[str, float]] = {}
+
+
 @app.post("/voice/reply-callback")
 async def voice_reply_callback(request: Request, req: VoiceReplyCallback):
-    """Receive reply from any runtime adapter, log and optionally trigger TTS."""
+    """Receive reply from any runtime adapter, store for PWA pickup."""
     if not _check_pin(request):
         return JSONResponse({"error": "Invalid PIN"}, status_code=401)
     if not req.text.strip():
@@ -689,10 +692,28 @@ async def voice_reply_callback(request: Request, req: VoiceReplyCallback):
     source = req.runtime_id or "claude-code"
     logger.info("Voice reply [%s]: text=%r", source, req.text[:60])
 
+    if req.message_id:
+        _pending_replies[req.message_id] = (req.text, time.time())
+        # evict old entries (>5 min)
+        cutoff = time.time() - 300
+        for k in [k for k, v in _pending_replies.items() if v[1] < cutoff]:
+            del _pending_replies[k]
+
     if DISCORD_WEBHOOK:
         asyncio.create_task(_discord_post_webhook(f"🫧 {req.text}", f"青喵 (語音回覆/{source})"))
 
     return {"ok": True, "text_length": len(req.text), "runtime": source}
+
+
+@app.get("/voice/reply/{message_id}")
+async def get_reply(request: Request, message_id: str):
+    """Poll for a voice reply by message_id. Returns text when ready."""
+    if not _check_pin(request):
+        return JSONResponse({"error": "Invalid PIN"}, status_code=401)
+    entry = _pending_replies.pop(message_id, None)
+    if entry is None:
+        return {"status": "pending"}
+    return {"status": "ready", "text": entry[0]}
 
 
 class PinAuthRequest(BaseModel):
