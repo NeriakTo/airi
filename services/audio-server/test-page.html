@@ -170,7 +170,13 @@ async function toggleVoice() {
 
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
+    const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+      ? 'audio/webm;codecs=opus'
+      : MediaRecorder.isTypeSupported('audio/mp4') ? 'audio/mp4' : '';
+    mediaRecorder = mimeType
+      ? new MediaRecorder(stream, { mimeType })
+      : new MediaRecorder(stream);
+    const recMime = mediaRecorder.mimeType;
     chunks = [];
     mediaRecorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
 
@@ -181,7 +187,7 @@ async function toggleVoice() {
       stream.getTracks().forEach(t => t.stop());
 
       try {
-        await processVoice(new Blob(chunks, { type: 'audio/webm' }));
+        await processVoice(new Blob(chunks, { type: recMime }));
       } catch (e) {
         addMsg('system', '錯誤: ' + e.message);
       } finally {
@@ -199,23 +205,36 @@ async function toggleVoice() {
   }
 }
 
-async function processVoice(webmBlob) {
-  setPhase('轉換音訊…', '');
-  const arrayBuf = await webmBlob.arrayBuffer();
-  const audioCtx = new AudioContext();
-  const decoded = await audioCtx.decodeAudioData(arrayBuf);
-  const pcm = decoded.getChannelData(0);
-  const wavBuf = encodeWAV(pcm, decoded.sampleRate);
-  const wavBlob = new Blob([wavBuf], { type: 'audio/wav' });
-  audioCtx.close();
+async function processVoice(audioBlob) {
+  var wavBlob = audioBlob;
+  var ext = audioBlob.type.includes('mp4') ? 'mp4' : audioBlob.type.includes('webm') ? 'webm' : 'wav';
+
+  // Try client-side WAV conversion; if it fails (iOS Safari), send raw blob
+  if (typeof AudioContext !== 'undefined') {
+    try {
+      setPhase('轉換音訊…', '');
+      var arrayBuf = await audioBlob.arrayBuffer();
+      var audioCtx = new AudioContext();
+      var decoded = await audioCtx.decodeAudioData(arrayBuf);
+      var pcm = decoded.getChannelData(0);
+      var wavBuf = encodeWAV(pcm, decoded.sampleRate);
+      wavBlob = new Blob([wavBuf], { type: 'audio/wav' });
+      ext = 'wav';
+      audioCtx.close();
+    } catch (e) {
+      console.warn('Client-side WAV conversion failed, sending raw audio:', e);
+      wavBlob = audioBlob;
+    }
+  }
 
   setPhase('語音辨識中…', (wavBlob.size / 1024).toFixed(0) + ' KB');
-  const sttForm = new FormData();
-  sttForm.append('file', wavBlob, 'voice.wav');
-  const sttRes = await fetch(getServer() + '/v1/audio/transcriptions?model=whisper-large-v3-turbo&language=zh', {
+  var sttForm = new FormData();
+  sttForm.append('file', wavBlob, 'voice.' + ext);
+  var sttRes = await fetch(getServer() + '/v1/audio/transcriptions?model=whisper-large-v3-turbo&language=zh', {
     method: 'POST', body: sttForm
   });
-  const sttData = await sttRes.json();
+  if (!sttRes.ok) throw new Error('STT 失敗: ' + sttRes.status);
+  var sttData = await sttRes.json();
   const userText = sttData.text;
   if (!userText || !userText.trim()) {
     addMsg('system', '未偵測到語音');
@@ -223,14 +242,24 @@ async function processVoice(webmBlob) {
   }
   addMsg('user', userText);
 
-  setPhase('傳送給青喵…', '等待回覆中');
+  setPhase('傳送給青喵…', '等待回覆中（約 10-30 秒）');
   const t0 = Date.now();
-  const dispatchRes = await fetch(getServer() + '/voice/dispatch', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text: userText }),
-  });
-  const dispatchData = await dispatchRes.json();
+  var dispatchRes, dispatchData;
+  try {
+    var ctrl = new AbortController();
+    var tid = setTimeout(function() { ctrl.abort(); }, 120000);
+    dispatchRes = await fetch(getServer() + '/voice/dispatch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: userText }),
+      signal: ctrl.signal,
+    });
+    clearTimeout(tid);
+    dispatchData = await dispatchRes.json();
+  } catch (fetchErr) {
+    addMsg('system', '連線中斷，請重試（' + fetchErr.message + '）');
+    return;
+  }
   const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
 
   if (dispatchData.timeout || !dispatchData.text) {

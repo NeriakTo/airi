@@ -247,7 +247,10 @@ async def stt_transcribe(
 
     t_start = time.time()
 
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+    suffix = Path(file.filename).suffix if file.filename else ".wav"
+    if not suffix:
+        suffix = ".wav"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         content = await file.read()
         tmp.write(content)
         tmp_path = tmp.name
@@ -325,13 +328,16 @@ def _route_prefix(text: str) -> tuple[str, str]:
     return VOICE_CHANNEL_ID, text.strip()
 
 
-def _discord_post_webhook(text: str, username: str = "🎙️ Kevin (語音)") -> dict | None:
+_DISCORD_HEADERS = {"Content-Type": "application/json", "User-Agent": "MeowVoice/1.0"}
+
+
+def _discord_post_webhook(text: str, username: str = "Kevin (語音)") -> dict | None:
     """Post a message via Discord webhook. Returns the created message."""
     if not DISCORD_WEBHOOK:
         return None
     url = DISCORD_WEBHOOK + "?wait=true"
     data = json.dumps({"content": text, "username": username}).encode()
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(url, data=data, headers=_DISCORD_HEADERS)
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             return json.loads(resp.read())
@@ -345,7 +351,8 @@ def _discord_fetch_replies(channel_id: str, after_id: str) -> list[dict]:
     if not DISCORD_BOT_TOKEN:
         return []
     url = f"https://discord.com/api/v10/channels/{channel_id}/messages?after={after_id}&limit=20"
-    req = urllib.request.Request(url, headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"})
+    headers = {"Authorization": f"Bot {DISCORD_BOT_TOKEN}", "User-Agent": "MeowVoice/1.0"}
+    req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             return json.loads(resp.read())
@@ -361,17 +368,36 @@ class VoiceDispatchRequest(BaseModel):
 
 _dispatch_lock = asyncio.Lock()
 
-# NOTICE: POC 架構 — webhook 直送 + Discord REST 輪詢。
-# E-lite 正式架構為 TriClaw daemon /api/voice-input + SSE 訂閱（V1-V4 待實作）。
+VOICE_SYSTEM_PROMPT = """你是青喵（CyanMeow），Kevin 的 AI 主控核心。現在是語音對話模式。
+回覆規則：繁體中文、口語化、2-4 句話以內、先結論再補充、不用 markdown。"""
+
+
+async def _claude_cli_process(text: str) -> str | None:
+    """Call claude CLI in one-shot mode to process voice text."""
+    proc = await asyncio.create_subprocess_exec(
+        "claude", "-p", "--max-turns", "1",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(input=text.encode()),
+            timeout=DISPATCH_TIMEOUT,
+        )
+        if proc.returncode == 0 and stdout:
+            return stdout.decode().strip()
+        logger.error("claude CLI failed: rc=%s stderr=%s", proc.returncode, stderr.decode()[:200])
+        return None
+    except asyncio.TimeoutError:
+        proc.kill()
+        logger.error("claude CLI timeout after %ds", DISPATCH_TIMEOUT)
+        return None
+
 
 @app.post("/voice/dispatch")
 async def voice_dispatch(req: VoiceDispatchRequest):
-    """Send voice text to Discord and wait for CyanMeow's reply."""
-    if not DISCORD_WEBHOOK:
-        return JSONResponse({"error": "MEOWVOICE_DISCORD_WEBHOOK not configured"}, status_code=503)
-    if not DISCORD_BOT_TOKEN:
-        return JSONResponse({"error": "Discord bot token not configured"}, status_code=503)
-
+    """Process voice text via claude CLI and return response."""
     async with _dispatch_lock:
         return await _do_dispatch(req)
 
@@ -385,43 +411,27 @@ async def _do_dispatch(req: VoiceDispatchRequest) -> dict:
     if target_channel != VOICE_CHANNEL_ID:
         display_text = f"[→ <#{target_channel}>] {cleaned}"
 
-    msg = await asyncio.to_thread(_discord_post_webhook, display_text)
-    if not msg or "id" not in msg:
-        return JSONResponse({"error": "Failed to post to Discord"}, status_code=502)
+    # Audit trail: post to Discord (fire-and-forget)
+    if DISCORD_WEBHOOK:
+        asyncio.get_event_loop().run_in_executor(None, _discord_post_webhook, display_text)
 
-    posted_id = msg["id"]
-    logger.info("Voice dispatched: text=%r context=%s msg_id=%s", cleaned[:40], target_channel, posted_id)
-
+    logger.info("Voice dispatch: text=%r context=%s", cleaned[:40], target_channel)
     t_start = time.time()
-    collected: list[str] = []
-    first_reply_at: float | None = None
 
-    while time.time() - t_start < DISPATCH_TIMEOUT:
-        await asyncio.sleep(2)
-        messages = await asyncio.to_thread(_discord_fetch_replies, VOICE_CHANNEL_ID, posted_id)
-        # Discord GET messages?after= returns newest-first; reverse to process oldest-first
-        messages.reverse()
-
-        for m in messages:
-            author = m.get("author", {})
-            content = m.get("content", "").strip()
-            if author.get("id") == CYANMEOW_BOT_ID and content:
-                mid = m.get("id")
-                if mid not in [c[0] for c in collected]:
-                    collected.append((mid, content))
-                    if first_reply_at is None:
-                        first_reply_at = time.time()
-
-        if first_reply_at is not None and time.time() - first_reply_at > 4:
-            break
+    reply_text = await _claude_cli_process(cleaned)
 
     elapsed = time.time() - t_start
-    if not collected:
-        logger.warning("Voice dispatch timeout after %.1fs", elapsed)
+    if not reply_text:
+        logger.warning("Voice dispatch failed after %.1fs", elapsed)
         return JSONResponse({"text": "", "timeout": True, "elapsed": elapsed})
 
-    reply_text = "\n\n".join(text for _, text in collected)
-    logger.info("Voice reply received: %d parts, text=%r elapsed=%.1fs", len(collected), reply_text[:50], elapsed)
+    # Audit trail: post response to Discord
+    if DISCORD_WEBHOOK:
+        asyncio.get_event_loop().run_in_executor(
+            None, _discord_post_webhook, f"🫧 {reply_text}", "青喵 (語音回覆)"
+        )
+
+    logger.info("Voice reply: text=%r elapsed=%.1fs", reply_text[:50], elapsed)
     return {"text": reply_text, "timeout": False, "elapsed": elapsed}
 
 
