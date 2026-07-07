@@ -46,7 +46,7 @@ TTS_MODEL_ID = os.environ.get(
 )
 STT_MODEL_ID = os.environ.get(
     "MEOWVOICE_STT_MODEL",
-    "mlx-community/whisper-large-v3-turbo",
+    "eoleedi/Breeze-ASR-25-mlx",
 )
 TTS_VOICE = os.environ.get("MEOWVOICE_TTS_VOICE", "Chelsie")
 HOST = os.environ.get("MEOWVOICE_HOST", "127.0.0.1")
@@ -100,6 +100,41 @@ CHANNEL_ROUTES: list[tuple[list[str], str]] = [
     (["威益"], "1487269649732341770"),
     (["富永"], "1475782950246420611"),
 ]
+
+STT_BASE_PROMPT = "以下是繁體中文與英文混雜語音的轉錄。"
+STT_GLOBAL_TERMS = "青喵、黑喵、貓爪、灰喵、小野、TriClaw、MeowVoice、Kevin"
+
+CHANNEL_TERMS: dict[str, str] = {
+    "1486183810143097093": "TriClaw、EventStore、correlation ID、SSE、Kernel、Runtime、Skill",
+    "1480803774116266110": "連線科技、MES、Galaxy、webhook、schema、Drizzle、BOM、HURCO、Dictionary、Pipeline",
+    "1489111296103288952": "全有織造、forecast、MCO、品號、MES",
+    "1511980894246801538": "印比雅、鉅茂、ITEC、BI、POC",
+    "1504401236349157547": "DG+、MQTT、派車、dispatch",
+    "1521075633441214566": "三菱電梯、Facteye、CEC、Node.js",
+    "1514862156401610752": "紡織雲、iTEXTILES、QR、Galaxy",
+    "1485467155456589954": "昕鈺、BOM、CAD、Galaxy",
+    "1475786438397132801": "來永、AI HR、Supabase、104、webhook、Galaxy",
+    "1489613734581374976": "帝寶、物業、Hermes、Galaxy",
+    "1499551630914486283": "章治、RDT、SBIR、補助",
+    "1484010621090402383": "聯祥、e-QA、品質管理",
+    "1516963879702237245": "鴻法、SBIR、HPM",
+    "1505045689351147631": "GX10、A100、Azure、GPU、DGX",
+    "1523300651092672622": "FY-DGX01、GX10、Hermes、Andy",
+    "1520807144234942494": "FortiGate、70D、SSL VPN、防火牆",
+    "1487269649732341770": "威益、FortiGate、140D、Galaxy",
+    "1475782950246420611": "富永、梁顧問、輔導、對帳單",
+}
+
+
+def build_stt_prompt(channel_id: str = "") -> str:
+    parts = [STT_BASE_PROMPT]
+    channel_terms = CHANNEL_TERMS.get(channel_id, "")
+    all_terms = STT_GLOBAL_TERMS
+    if channel_terms:
+        all_terms += "、" + channel_terms
+    parts.append(f"{all_terms}是專有名詞。")
+    return "".join(parts)
+
 
 tts_model = None
 stt_model_id = None
@@ -209,8 +244,9 @@ async def tts_generate(req: TtsRequest):
 async def stt_transcribe(
     file: UploadFile = File(..., description="WAV audio file"),
     lang: str = Query(default="zh", description="Language hint"),
+    channel_id: str = Query(default="", description="Channel ID for terminology prompt"),
 ):
-    """Transcribe audio to text using mlx-whisper."""
+    """Transcribe audio to text using mlx-whisper with dynamic terminology."""
     import mlx_whisper  # noqa: E402 — lazy import to avoid load at startup
 
     t_start = time.time()
@@ -224,17 +260,18 @@ async def stt_transcribe(
         tmp_path = tmp.name
 
     try:
+        prompt = build_stt_prompt(channel_id)
         result = mlx_whisper.transcribe(
             tmp_path,
             path_or_hf_repo=stt_model_id,
             language=lang,
             verbose=False,
-            initial_prompt="以下是繁體中文語音內容的轉錄。青喵、灰喵、黑喵、貓爪、小野是 AI 助手的名字。",
-            condition_on_previous_text=False,
+            initial_prompt=prompt,
+            condition_on_previous_text=True,
         )
         text = result.get("text", "").strip()
         duration = time.time() - t_start
-        logger.info("STT done: text=%r time=%.2fs", text[:50], duration)
+        logger.info("STT done: text=%r time=%.2fs prompt_channel=%s", text[:50], duration, channel_id or "default")
         return {"text": text, "language": lang, "duration": duration}
     finally:
         os.unlink(tmp_path)
@@ -247,7 +284,7 @@ async def openai_models():
         "object": "list",
         "data": [
             {"id": "qwen3-tts", "object": "model", "owned_by": "meowvoice"},
-            {"id": "whisper-large-v3-turbo", "object": "model", "owned_by": "meowvoice"},
+            {"id": "breeze-asr-25", "object": "model", "owned_by": "meowvoice"},
         ],
     }
 
@@ -270,11 +307,12 @@ async def openai_speech(req: OpenAISpeechRequest):
 @app.post("/v1/audio/transcriptions")
 async def openai_transcriptions(
     file: UploadFile = File(...),
-    model: str = Query(default="whisper-large-v3-turbo"),
+    model: str = Query(default="breeze-asr-25"),
     language: str = Query(default="zh"),
+    channel_id: str = Query(default="", alias="channel_id"),
 ):
-    """OpenAI-compatible STT endpoint for AIRI xsai integration."""
-    result = await stt_transcribe(file=file, lang=language)
+    """OpenAI-compatible STT endpoint with dynamic terminology."""
+    result = await stt_transcribe(file=file, lang=language, channel_id=channel_id)
     return {"text": result["text"]}
 
 

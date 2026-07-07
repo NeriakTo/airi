@@ -230,7 +230,7 @@ async function processVoice(audioBlob) {
   setPhase('語音辨識中…', (wavBlob.size / 1024).toFixed(0) + ' KB');
   var sttForm = new FormData();
   sttForm.append('file', wavBlob, 'voice.' + ext);
-  var sttRes = await fetch(getServer() + '/v1/audio/transcriptions?model=whisper-large-v3-turbo&language=zh', {
+  var sttRes = await fetch(getServer() + '/v1/audio/transcriptions?model=breeze-asr-25&language=zh', {
     method: 'POST', body: sttForm
   });
   if (!sttRes.ok) throw new Error('STT 失敗: ' + sttRes.status);
