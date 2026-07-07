@@ -12,8 +12,7 @@ import wave
 import asyncio
 import tempfile
 import logging
-import urllib.request
-import urllib.error
+import hmac
 from contextlib import asynccontextmanager
 
 from pathlib import Path
@@ -23,6 +22,7 @@ import uvicorn
 from fastapi import FastAPI, Request, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
+import httpx
 
 logger = logging.getLogger("meowvoice-audio")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -144,7 +144,9 @@ def build_stt_prompt(channel_id: str = "") -> str:
 
 tts_model = None
 stt_model_id = None
-_mlx_lock = asyncio.Lock()
+_tts_lock = asyncio.Lock()
+_stt_lock = asyncio.Lock()
+_http_client: httpx.AsyncClient | None = None
 
 
 def load_tts():
@@ -203,19 +205,22 @@ def _generate_cached_voices() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _http_client
+    _http_client = httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0))
     load_tts()
     load_stt()
     _generate_cached_voices()
     voice_ok = bool(DISCORD_WEBHOOK and DISCORD_BOT_TOKEN)
     logger.info("Audio server ready on %s:%d (voice_bridge=%s, cached=%d)", HOST, PORT, voice_ok, len(_voice_cache))
     yield
+    await _http_client.aclose()
     logger.info("Audio server shutting down")
 
 
 app = FastAPI(title="MeowVoice Audio Server", lifespan=lifespan)
 ALLOWED_ORIGINS = os.environ.get(
     "MEOWVOICE_CORS_ORIGINS",
-    "http://localhost:5173,http://localhost:5174,http://127.0.0.1:5173,https://127.0.0.1:8400,https://meowvoice.nerigate.dev,https://airi.nerigate.dev",
+    "http://localhost:5173,http://localhost:5174,http://127.0.0.1:5173,https://127.0.0.1:8400,https://asr.nerigate.dev,https://airi.nerigate.dev",
 ).split(",")
 app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_methods=["*"], allow_headers=["*"])
 
@@ -247,7 +252,7 @@ class TtsRequest(BaseModel):
 @app.post("/tts")
 async def tts_generate(req: TtsRequest):
     """Generate speech from text. Returns WAV audio."""
-    async with _mlx_lock:
+    async with _tts_lock:
         return await _tts_generate_inner(req)
 
 
@@ -313,7 +318,7 @@ async def stt_transcribe(
 
     try:
         prompt = build_stt_prompt(channel_id)
-        async with _mlx_lock:
+        async with _stt_lock:
             result = mlx_whisper.transcribe(
                 tmp_path,
                 path_or_hf_repo=stt_model_id,
@@ -430,37 +435,19 @@ def _route_prefix(text: str) -> tuple[str, str]:
     return VOICE_CHANNEL_ID, text.strip()
 
 
-_DISCORD_HEADERS = {"Content-Type": "application/json", "User-Agent": "MeowVoice/1.0"}
-
-
-def _discord_post_webhook(text: str, username: str = "Kevin (語音)") -> dict | None:
-    """Post a message via Discord webhook. Returns the created message."""
-    if not DISCORD_WEBHOOK:
+async def _discord_post_webhook(text: str, username: str = "Kevin (語音)") -> dict | None:
+    """Post a message via Discord webhook."""
+    if not DISCORD_WEBHOOK or not _http_client:
         return None
-    url = DISCORD_WEBHOOK + "?wait=true"
-    data = json.dumps({"content": text, "username": username}).encode()
-    req = urllib.request.Request(url, data=data, headers=_DISCORD_HEADERS)
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read())
+        resp = await _http_client.post(
+            DISCORD_WEBHOOK, params={"wait": "true"},
+            json={"content": text, "username": username},
+        )
+        return resp.json() if resp.is_success else None
     except Exception as e:
         logger.error("Webhook post failed: %s", e)
         return None
-
-
-def _discord_fetch_replies(channel_id: str, after_id: str) -> list[dict]:
-    """Fetch messages in a channel after a given message ID."""
-    if not DISCORD_BOT_TOKEN:
-        return []
-    url = f"https://discord.com/api/v10/channels/{channel_id}/messages?after={after_id}&limit=20"
-    headers = {"Authorization": f"Bot {DISCORD_BOT_TOKEN}", "User-Agent": "MeowVoice/1.0"}
-    req = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read())
-    except Exception as e:
-        logger.error("Discord fetch failed: %s", e)
-        return []
 
 
 class VoiceDispatchRequest(BaseModel):
@@ -469,33 +456,23 @@ class VoiceDispatchRequest(BaseModel):
 
 
 def _check_pin(request) -> bool:
-    """Validate 6-digit PIN from X-Voice-Pin header."""
+    """Validate 6-digit PIN from X-Voice-Pin header (timing-safe comparison)."""
     if not VOICE_PIN:
         return False
-    return request.headers.get("x-voice-pin", "") == VOICE_PIN
+    return hmac.compare_digest(request.headers.get("x-voice-pin", ""), VOICE_PIN)
 
 
 async def _inject_to_plugin(text: str) -> dict:
     """POST STT text to the voice channel plugin for injection into Claude Code session."""
-    body = json.dumps({"text": text}).encode()
-    headers = {
-        "Content-Type": "application/json",
-        "X-Voice-Pin": VOICE_PIN,
-    }
-    req = urllib.request.Request(
-        f"{VOICE_PLUGIN_URL}/inject",
-        data=body, headers=headers,
-    )
+    if not _http_client:
+        return {"error": "HTTP client not initialized"}
     try:
-        loop = asyncio.get_running_loop()
-        resp_data: bytes = await asyncio.wait_for(
-            loop.run_in_executor(
-                None,
-                lambda: urllib.request.urlopen(req, timeout=10).read(),
-            ),
-            timeout=15,
+        resp = await _http_client.post(
+            f"{VOICE_PLUGIN_URL}/inject",
+            json={"text": text},
+            headers={"X-Voice-Pin": VOICE_PIN},
         )
-        return json.loads(resp_data)
+        return resp.json()
     except Exception as e:
         logger.error("Voice plugin inject failed: %s", e)
         return {"error": str(e)}
@@ -516,7 +493,7 @@ async def voice_dispatch(request: Request, req: VoiceDispatchRequest):
         display_text = f"[→ <#{target_channel}>] {cleaned}"
 
     if DISCORD_WEBHOOK:
-        asyncio.get_running_loop().run_in_executor(None, _discord_post_webhook, display_text)
+        asyncio.ensure_future(_discord_post_webhook(display_text))
 
     logger.info("Voice inject: text=%r", cleaned[:60])
     t_start = time.time()
@@ -549,9 +526,7 @@ async def voice_reply_callback(request: Request, req: VoiceReplyCallback):
     logger.info("Voice reply received: text=%r", req.text[:60])
 
     if DISCORD_WEBHOOK:
-        asyncio.get_running_loop().run_in_executor(
-            None, _discord_post_webhook, f"🫧 {req.text}", "青喵 (語音回覆)"
-        )
+        asyncio.ensure_future(_discord_post_webhook(f"🫧 {req.text}", "青喵 (語音回覆)"))
 
     return {"ok": True, "text_length": len(req.text)}
 
@@ -570,7 +545,7 @@ async def cached_voice(key: str):
     return StreamingResponse(io.BytesIO(data), media_type="audio/wav")
 
 
-@app.get("/test", response_class=HTMLResponse)
+@app.get("/", response_class=HTMLResponse)
 async def test_page():
     """Browser-based voice test/conversation page for mobile/desktop."""
     if TEST_PAGE.exists():
