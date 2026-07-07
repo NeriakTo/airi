@@ -10,9 +10,12 @@ import json
 import time
 import wave
 import asyncio
+import hashlib
+import secrets
 import tempfile
 import logging
 import hmac
+from collections import defaultdict
 from contextlib import asynccontextmanager
 
 from pathlib import Path
@@ -58,6 +61,71 @@ CYANMEOW_BOT_ID = os.environ.get("MEOWVOICE_CYANMEOW_BOT_ID", "14901937874635327
 DISPATCH_TIMEOUT = int(os.environ.get("MEOWVOICE_DISPATCH_TIMEOUT", "60"))
 VOICE_PIN = os.environ.get("MEOWVOICE_PIN", "")
 VOICE_PLUGIN_URL = os.environ.get("MEOWVOICE_VOICE_PLUGIN", "http://127.0.0.1:8401")
+
+# --- PIN security infrastructure ---
+_MEOWVOICE_DIR = Path.home() / ".meowvoice"
+_PIN_HASH_FILE = _MEOWVOICE_DIR / "pin.hash"
+_PIN_SALT_FILE = _MEOWVOICE_DIR / "pin.salt"
+_RATE_LIMIT_MAX = 5
+_RATE_LIMIT_WINDOW = 60
+_SESSION_DURATION = 3600
+_rate_limits: dict[str, list[float]] = defaultdict(list)
+_sessions: dict[str, float] = {}
+
+
+def _hash_pin(pin: str, salt: bytes) -> str:
+    return hashlib.pbkdf2_hmac("sha256", pin.encode(), salt, 100_000).hex()
+
+
+def _init_pin_storage() -> None:
+    if _PIN_HASH_FILE.exists():
+        return
+    if not VOICE_PIN:
+        return
+    _MEOWVOICE_DIR.mkdir(parents=True, exist_ok=True)
+    salt = secrets.token_bytes(32)
+    _PIN_SALT_FILE.write_bytes(salt)
+    _PIN_HASH_FILE.write_text(_hash_pin(VOICE_PIN, salt))
+    logger.info("PIN hash initialized (PBKDF2-SHA256, 100k rounds)")
+
+
+def _verify_pin(pin: str) -> bool:
+    if not pin:
+        return False
+    if _PIN_HASH_FILE.exists() and _PIN_SALT_FILE.exists():
+        salt = _PIN_SALT_FILE.read_bytes()
+        expected = _PIN_HASH_FILE.read_text().strip()
+        return hmac.compare_digest(_hash_pin(pin, salt), expected)
+    if not VOICE_PIN:
+        return False
+    return hmac.compare_digest(pin, VOICE_PIN)
+
+
+def _check_rate_limit(ip: str) -> bool:
+    now = time.time()
+    attempts = _rate_limits[ip]
+    _rate_limits[ip] = [t for t in attempts if now - t < _RATE_LIMIT_WINDOW]
+    return len(_rate_limits[ip]) < _RATE_LIMIT_MAX
+
+
+def _record_failed_attempt(ip: str) -> None:
+    _rate_limits[ip].append(time.time())
+
+
+def _create_session() -> str:
+    token = secrets.token_urlsafe(32)
+    _sessions[token] = time.time() + _SESSION_DURATION
+    return token
+
+
+def _verify_session(token: str) -> bool:
+    expiry = _sessions.get(token)
+    if not expiry:
+        return False
+    if time.time() > expiry:
+        del _sessions[token]
+        return False
+    return True
 
 def _load_discord_bot_token() -> str:
     token = os.environ.get("MEOWVOICE_DISCORD_BOT_TOKEN", "")
@@ -239,6 +307,7 @@ def _generate_cached_voices() -> None:
 async def lifespan(app: FastAPI):
     global _http_client
     _http_client = httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0))
+    _init_pin_storage()
     load_tts()
     load_stt()
     _generate_cached_voices()
@@ -254,7 +323,10 @@ ALLOWED_ORIGINS = os.environ.get(
     "MEOWVOICE_CORS_ORIGINS",
     "http://localhost:5173,http://localhost:5174,http://127.0.0.1:5173,https://127.0.0.1:8400,https://asr.nerigate.dev,https://airi.nerigate.dev",
 ).split(",")
-app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware, allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["*"], allow_headers=["*"], allow_credentials=True,
+)
 
 SSL_CERT = os.environ.get("MEOWVOICE_SSL_CERT", "/tmp/meowvoice-cert.pem")
 SSL_KEY = os.environ.get("MEOWVOICE_SSL_KEY", "/tmp/meowvoice-key.pem")
@@ -488,11 +560,21 @@ class VoiceDispatchRequest(BaseModel):
     runtime: str | None = None
 
 
-def _check_pin(request) -> bool:
-    """Validate 6-digit PIN from X-Voice-Pin header (timing-safe comparison)."""
-    if not VOICE_PIN:
+def _check_pin(request: Request) -> bool:
+    """Validate via session cookie first, then PIN header with rate limiting."""
+    session_token = request.cookies.get("meowvoice_session")
+    if session_token and _verify_session(session_token):
+        return True
+    pin = request.headers.get("x-voice-pin", "")
+    if not pin:
         return False
-    return hmac.compare_digest(request.headers.get("x-voice-pin", ""), VOICE_PIN)
+    client_ip = request.client.host if request.client else "unknown"
+    if not _check_rate_limit(client_ip):
+        return False
+    if _verify_pin(pin):
+        return True
+    _record_failed_attempt(client_ip)
+    return False
 
 
 async def _dispatch_to_runtime(text: str, runtime_id: str | None = None) -> dict:
@@ -599,6 +681,51 @@ async def voice_reply_callback(request: Request, req: VoiceReplyCallback):
         asyncio.ensure_future(_discord_post_webhook(f"🫧 {req.text}", f"青喵 (語音回覆/{source})"))
 
     return {"ok": True, "text_length": len(req.text), "runtime": source}
+
+
+class PinAuthRequest(BaseModel):
+    pin: str
+
+
+@app.post("/voice/auth")
+async def pin_auth(request: Request, req: PinAuthRequest):
+    """Authenticate with PIN, receive httpOnly session cookie."""
+    client_ip = request.client.host if request.client else "unknown"
+    if not _check_rate_limit(client_ip):
+        logger.warning("Rate limited: %s", client_ip)
+        return JSONResponse({"error": "Too many attempts, try again later"}, status_code=429)
+    if not _verify_pin(req.pin):
+        _record_failed_attempt(client_ip)
+        return JSONResponse({"error": "Invalid PIN"}, status_code=401)
+    token = _create_session()
+    response = JSONResponse({"ok": True, "expires_in": _SESSION_DURATION})
+    response.set_cookie(
+        "meowvoice_session", token,
+        httponly=True, secure=True, samesite="strict",
+        max_age=_SESSION_DURATION,
+    )
+    return response
+
+
+class PinSetupRequest(BaseModel):
+    pin: str
+
+
+@app.post("/voice/pin/setup")
+async def pin_setup(request: Request, req: PinSetupRequest):
+    """First-time PIN setup. Restricted to localhost."""
+    if _PIN_HASH_FILE.exists():
+        return JSONResponse({"error": "PIN already configured"}, status_code=409)
+    client_ip = request.client.host if request.client else ""
+    if client_ip not in ("127.0.0.1", "::1"):
+        return JSONResponse({"error": "PIN setup restricted to localhost"}, status_code=403)
+    if len(req.pin) != 6 or not req.pin.isdigit():
+        return JSONResponse({"error": "PIN must be exactly 6 digits"}, status_code=400)
+    salt = secrets.token_bytes(32)
+    _PIN_SALT_FILE.write_bytes(salt)
+    _PIN_HASH_FILE.write_text(_hash_pin(req.pin, salt))
+    logger.info("PIN setup completed from %s", client_ip)
+    return {"ok": True}
 
 
 @app.get("/voice/runtimes")
