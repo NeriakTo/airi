@@ -1,385 +1,255 @@
-<title>MeowVoice 語音對話</title>
+<title>MeowVoice</title>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <link rel="manifest" href="data:application/json,%7B%22name%22%3A%22MeowVoice%22%2C%22short_name%22%3A%22MeowVoice%22%2C%22display%22%3A%22standalone%22%2C%22background_color%22%3A%22%23111820%22%2C%22theme_color%22%3A%22%231aafa0%22%7D">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 
 <style>
-  :root {
-    --bg: #f6f8fa; --surface: #ffffff; --text: #1a2332; --text-muted: #5a6a7e;
-    --cyan: #1aafa0; --cyan-soft: #d5f0ed; --cyan-glow: rgba(26,175,160,0.12);
-    --border: #dfe4ea; --red: #d94848; --green: #2ea86f;
-    --radius: 10px;
-    --font: system-ui, -apple-system, sans-serif;
-    --mono: 'SF Mono', 'Cascadia Code', monospace;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root { --bg: #111820; --surface: #1a2332; --text: #e2e8f0; --text-muted: #8a9ab5;
-      --cyan-soft: rgba(26,175,160,0.15); --cyan-glow: rgba(26,175,160,0.08); --border: #2a3545; }
-  }
-  :root[data-theme="dark"] { --bg: #111820; --surface: #1a2332; --text: #e2e8f0; --text-muted: #8a9ab5;
-    --cyan-soft: rgba(26,175,160,0.15); --cyan-glow: rgba(26,175,160,0.08); --border: #2a3545; }
-  :root[data-theme="light"] { --bg: #f6f8fa; --surface: #ffffff; --text: #1a2332; --text-muted: #5a6a7e;
-    --cyan-soft: #d5f0ed; --cyan-glow: rgba(26,175,160,0.12); --border: #dfe4ea; }
+  :root { --bg: #111820; --surface: #1a2332; --text: #e2e8f0; --muted: #8a9ab5;
+    --cyan: #1aafa0; --cyan-dim: rgba(26,175,160,0.15); --border: #2a3545;
+    --red: #d94848; --green: #2ea86f; --font: system-ui, -apple-system, sans-serif; }
 
-  * { margin: 0; padding: 0; box-sizing: border-box; }
+  * { margin: 0; padding: 0; box-sizing: border-box; -webkit-user-select: none; user-select: none; }
   body { font-family: var(--font); background: var(--bg); color: var(--text);
-    min-height: 100vh; min-height: 100dvh; display: flex; flex-direction: column; }
+    height: 100vh; height: 100dvh; display: flex; flex-direction: column; overflow: hidden; }
 
-  .header { padding: 1rem; text-align: center; border-bottom: 1px solid var(--border); }
-  .header h1 { font-size: 1.2rem; font-weight: 600; display: flex; align-items: center; justify-content: center; gap: 0.4rem; }
-  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--red); display: inline-block; transition: background 0.3s; }
-  .dot.online { background: var(--green); }
-  .status-text { font-size: 0.75rem; color: var(--text-muted); font-family: var(--mono); margin-top: 0.25rem; }
+  .top-bar { padding: 0.6rem 1rem; display: flex; align-items: center; gap: 0.5rem; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--red); }
+  .dot.on { background: var(--green); }
+  .top-bar .title { font-size: 0.85rem; font-weight: 600; }
+  .top-bar .sub { font-size: 0.65rem; color: var(--muted); margin-left: auto; }
 
-  .chat { flex: 1; overflow-y: auto; padding: 1rem; display: flex; flex-direction: column; gap: 0.75rem; }
+  .chat { flex: 1; overflow-y: auto; padding: 0.75rem; display: flex; flex-direction: column; gap: 0.5rem;
+    -webkit-overflow-scrolling: touch; }
 
-  .msg { max-width: 85%; padding: 0.65rem 0.9rem; border-radius: var(--radius); font-size: 0.9rem; line-height: 1.5; word-break: break-word; }
-  .msg.user { align-self: flex-end; background: var(--cyan); color: #fff; border-bottom-right-radius: 3px; }
-  .msg.bot { align-self: flex-start; background: var(--surface); border: 1px solid var(--border); border-bottom-left-radius: 3px; }
-  .msg.system { align-self: center; background: var(--cyan-glow); color: var(--text-muted); font-size: 0.78rem; border-radius: 20px; padding: 0.3rem 0.8rem; }
-  .msg .meta { font-size: 0.68rem; color: var(--text-muted); margin-top: 0.3rem; font-family: var(--mono); }
-  .msg.user .meta { color: rgba(255,255,255,0.7); }
+  .bubble { max-width: 82%; padding: 0.55rem 0.8rem; border-radius: 14px; font-size: 0.88rem; line-height: 1.45; word-break: break-word; }
+  .bubble.u { align-self: flex-end; background: var(--cyan); color: #fff; border-bottom-right-radius: 4px; }
+  .bubble.b { align-self: flex-start; background: var(--surface); border: 1px solid var(--border); border-bottom-left-radius: 4px; }
+  .bubble.s { align-self: center; background: var(--cyan-dim); color: var(--muted); font-size: 0.75rem; border-radius: 20px; padding: 0.25rem 0.7rem; }
+  .bubble .t { font-size: 0.6rem; color: var(--muted); margin-top: 0.2rem; }
+  .bubble.u .t { color: rgba(255,255,255,0.6); }
 
-  .controls { padding: 0.75rem 1rem; border-top: 1px solid var(--border); background: var(--surface);
-    display: flex; align-items: center; gap: 0.75rem; padding-bottom: max(0.75rem, env(safe-area-inset-bottom)); }
+  .mic-area { padding: 1rem; padding-bottom: max(1.2rem, env(safe-area-inset-bottom));
+    display: flex; flex-direction: column; align-items: center; gap: 0.5rem; }
 
-  .mic-btn { width: 56px; height: 56px; border-radius: 50%; border: 2px solid var(--border);
-    background: var(--surface); cursor: pointer; display: flex; align-items: center; justify-content: center;
-    transition: all 0.2s; flex-shrink: 0; }
-  .mic-btn:hover { border-color: var(--cyan); }
-  .mic-btn.recording { border-color: var(--red); background: rgba(217,72,72,0.08); animation: pulse 1.5s ease-in-out infinite; }
-  .mic-btn.processing { border-color: var(--cyan); opacity: 0.6; pointer-events: none; }
-  .mic-btn svg { width: 24px; height: 24px; fill: var(--text-muted); transition: fill 0.2s; }
-  .mic-btn:hover svg { fill: var(--cyan); }
-  .mic-btn.recording svg { fill: var(--red); }
+  .phase { font-size: 0.75rem; color: var(--muted); height: 1.2rem; text-align: center; }
 
-  @keyframes pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(217,72,72,0.25); } 50% { box-shadow: 0 0 0 10px rgba(217,72,72,0); } }
+  .mic { width: 90px; height: 90px; border-radius: 50%; border: 3px solid var(--border);
+    background: var(--surface); display: flex; align-items: center; justify-content: center;
+    transition: all 0.15s; touch-action: none; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+  .mic svg { width: 36px; height: 36px; fill: var(--muted); transition: fill 0.15s; }
+  .mic.hold { border-color: var(--red); background: rgba(217,72,72,0.12); transform: scale(1.12); }
+  .mic.hold svg { fill: var(--red); }
+  .mic.busy { border-color: var(--cyan); opacity: 0.5; pointer-events: none; }
+  .mic.busy svg { fill: var(--cyan); }
 
-  .controls-info { flex: 1; font-size: 0.78rem; color: var(--text-muted); }
-  .controls-info .phase { font-weight: 500; color: var(--text); }
+  @keyframes ripple { 0% { box-shadow: 0 0 0 0 rgba(217,72,72,0.3); } 100% { box-shadow: 0 0 0 20px rgba(217,72,72,0); } }
+  .mic.hold { animation: ripple 1s ease-out infinite; }
 
-  .config-toggle { font-size: 0.75rem; color: var(--text-muted); cursor: pointer; padding: 0.3rem; }
-  .config-panel { padding: 0.75rem 1rem; border-top: 1px solid var(--border); background: var(--surface); display: none; }
-  .config-panel.open { display: block; }
-  .config-panel label { font-size: 0.7rem; font-weight: 500; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; }
-  .config-panel input { font-family: var(--mono); font-size: 0.8rem; padding: 0.4rem 0.5rem; border: 1px solid var(--border);
-    border-radius: 6px; background: var(--bg); color: var(--text); outline: none; width: 100%; margin-top: 0.2rem; margin-bottom: 0.5rem; }
-  .config-panel input:focus { border-color: var(--cyan); }
-
-  .timer { font-family: var(--mono); font-size: 0.7rem; color: var(--cyan); font-variant-numeric: tabular-nums; }
+  .hint { font-size: 0.7rem; color: var(--muted); }
 
   audio { display: none; }
 </style>
 
-<div class="header">
-  <h1><span class="dot" id="dot"></span> MeowVoice <span style="font-size:0.7rem;color:var(--text-muted);font-weight:400">E-lite V2</span></h1>
-  <div class="status-text" id="statusText">connecting...</div>
+<div class="top-bar">
+  <span class="dot" id="dot"></span>
+  <span class="title">MeowVoice</span>
+  <span class="sub" id="sub"></span>
 </div>
 
 <div class="chat" id="chat"></div>
 
-<div class="config-panel" id="configPanel">
-  <label>Server URL</label>
-  <input id="serverUrl" value="" placeholder="留空 = 同 origin" spellcheck="false">
-</div>
-
-<div class="controls">
-  <button class="mic-btn" id="micBtn" onclick="toggleVoice()">
+<div class="mic-area">
+  <div class="phase" id="phase"></div>
+  <div class="mic" id="mic">
     <svg viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm-1-9c0-.55.45-1 1-1s1 .45 1 1v6c0 .55-.45 1-1 1s-1-.45-1-1V5z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>
-  </button>
-  <div class="controls-info">
-    <div class="phase" id="phaseText">點擊開始對話</div>
-    <div id="phaseDetail"></div>
   </div>
-  <span class="timer" id="timer"></span>
-  <span class="config-toggle" onclick="document.getElementById('configPanel').classList.toggle('open')">&#9881;</span>
+  <div class="hint" id="hint">按住說話</div>
 </div>
 
-<audio id="ttsAudio"></audio>
-<audio id="feedbackAudio"></audio>
+<audio id="ttsEl"></audio>
+<audio id="fbEl"></audio>
 
 <script>
-const HEARTBEAT_MS = 15000;
-const TIMEOUT_WARNING_MS = 60000;
-const ABORT_MS = 180000;
+var server = window.location.origin;
+var dot = document.getElementById('dot');
+var sub = document.getElementById('sub');
+var chat = document.getElementById('chat');
+var phase = document.getElementById('phase');
+var mic = document.getElementById('mic');
+var hint = document.getElementById('hint');
+var ttsEl = document.getElementById('ttsEl');
+var fbEl = document.getElementById('fbEl');
+var busy = false;
+var recorder = null;
+var chunks = [];
 
-const $ = id => document.getElementById(id);
-const dot = $('dot');
-const statusText = $('statusText');
-const micBtn = $('micBtn');
-const phaseText = $('phaseText');
-const phaseDetail = $('phaseDetail');
-const timerEl = $('timer');
-const chatEl = $('chat');
-const ttsAudio = $('ttsAudio');
-const feedbackAudio = $('feedbackAudio');
-
-let mediaRecorder = null;
-let chunks = [];
-let busy = false;
-let dispatchTimer = null;
-
-function getServer() { return $('serverUrl').value.trim().replace(/\/+$/, '') || window.location.origin; }
-
-function addMsg(role, text, meta) {
-  const div = document.createElement('div');
-  div.className = `msg ${role}`;
-  div.textContent = text;
-  if (meta) {
-    const m = document.createElement('div');
-    m.className = 'meta';
-    m.textContent = meta;
-    div.appendChild(m);
-  }
-  chatEl.appendChild(div);
-  chatEl.scrollTop = chatEl.scrollHeight;
-  return div;
+function msg(role, text, meta) {
+  var d = document.createElement('div');
+  d.className = 'bubble ' + role;
+  d.textContent = text;
+  if (meta) { var m = document.createElement('div'); m.className = 't'; m.textContent = meta; d.appendChild(m); }
+  chat.appendChild(d);
+  chat.scrollTop = chat.scrollHeight;
 }
 
-function setPhase(phase, detail) {
-  phaseText.textContent = phase;
-  phaseDetail.textContent = detail || '';
-}
+function setPhase(t) { phase.textContent = t || ''; }
 
-function startTimer() {
-  const t0 = Date.now();
-  dispatchTimer = setInterval(function() {
-    const s = ((Date.now() - t0) / 1000).toFixed(0);
-    timerEl.textContent = s + 's';
-  }, 500);
-}
-
-function stopTimer() {
-  if (dispatchTimer) { clearInterval(dispatchTimer); dispatchTimer = null; }
-  timerEl.textContent = '';
-}
-
-async function playAudioUrl(url) {
-  var res = await fetch(url);
-  var blob = await res.blob();
-  var objUrl = URL.createObjectURL(blob);
-  ttsAudio.src = objUrl;
-  await ttsAudio.play();
-  await new Promise(function(resolve) { ttsAudio.onended = resolve; });
-  URL.revokeObjectURL(objUrl);
-}
-
-function playFeedback(url) {
-  feedbackAudio.src = url;
-  feedbackAudio.play().catch(function() {});
-}
-
-function stopFeedback() {
-  feedbackAudio.pause();
-  feedbackAudio.src = '';
-}
-
-function splitSentences(text) {
-  var result = [];
-  var current = '';
-  for (var i = 0; i < text.length; i++) {
-    current += text[i];
-    if ('。！？!?\n'.indexOf(text[i]) >= 0) {
-      if (current.trim()) result.push(current.trim());
-      current = '';
-    }
-  }
-  if (current.trim()) result.push(current.trim());
-  if (result.length === 0 && text.trim()) result.push(text.trim());
-  return result;
-}
-
-async function checkHealth() {
-  try {
-    const res = await fetch(getServer() + '/health');
-    const data = await res.json();
-    dot.classList.add('online');
-    statusText.textContent = data.tts_model.split('/').pop() + ' + ' + data.stt_model.split('/').pop();
-  } catch (e) {
-    dot.classList.remove('online');
-    statusText.textContent = '無法連線';
-  }
-}
-
-function encodeWAV(samples, sampleRate) {
-  const buf = new ArrayBuffer(44 + samples.length * 2);
-  const v = new DataView(buf);
-  const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+function encodeWAV(samples, sr) {
+  var buf = new ArrayBuffer(44 + samples.length * 2);
+  var v = new DataView(buf);
+  var w = function(o, s) { for (var i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
   w(0,'RIFF'); v.setUint32(4, 36 + samples.length * 2, true);
   w(8,'WAVE'); w(12,'fmt '); v.setUint32(16, 16, true);
   v.setUint16(20, 1, true); v.setUint16(22, 1, true);
-  v.setUint32(24, sampleRate, true); v.setUint32(28, sampleRate * 2, true);
+  v.setUint32(24, sr, true); v.setUint32(28, sr * 2, true);
   v.setUint16(32, 2, true); v.setUint16(34, 16, true);
   w(36,'data'); v.setUint32(40, samples.length * 2, true);
-  for (let i = 0; i < samples.length; i++) {
-    const s = Math.max(-1, Math.min(1, samples[i]));
+  for (var i = 0; i < samples.length; i++) {
+    var s = Math.max(-1, Math.min(1, samples[i]));
     v.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
   }
   return buf;
 }
 
-async function toggleVoice() {
-  if (busy) return;
-  if (mediaRecorder && mediaRecorder.state === 'recording') {
-    mediaRecorder.stop();
-    return;
-  }
+function playFeedback(key) { fbEl.src = server + '/voice/cached/' + key; fbEl.play().catch(function(){}); }
+function stopFeedback() { fbEl.pause(); fbEl.src = ''; }
 
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+function splitSentences(text) {
+  var r = [], c = '';
+  for (var i = 0; i < text.length; i++) {
+    c += text[i];
+    if ('。！？!?\n'.indexOf(text[i]) >= 0) { if (c.trim()) r.push(c.trim()); c = ''; }
+  }
+  if (c.trim()) r.push(c.trim());
+  if (r.length === 0 && text.trim()) r.push(text.trim());
+  return r;
+}
+
+async function playTts(text) {
+  var res = await fetch(server + '/v1/audio/speech', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ input: text, voice: 'Chelsie', model: 'qwen3-tts' }),
+  });
+  var blob = await res.blob();
+  var url = URL.createObjectURL(blob);
+  ttsEl.src = url;
+  await ttsEl.play();
+  await new Promise(function(r) { ttsEl.onended = r; });
+  URL.revokeObjectURL(url);
+}
+
+// --- Press-and-hold recording ---
+function startRec() {
+  if (busy) return;
+  navigator.mediaDevices.getUserMedia({ audio: true }).then(function(stream) {
+    var mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
       ? 'audio/webm;codecs=opus'
       : MediaRecorder.isTypeSupported('audio/mp4') ? 'audio/mp4' : '';
-    mediaRecorder = mimeType
-      ? new MediaRecorder(stream, { mimeType })
-      : new MediaRecorder(stream);
-    const recMime = mediaRecorder.mimeType;
+    recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
     chunks = [];
-    mediaRecorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
-
-    mediaRecorder.onstop = async () => {
-      micBtn.classList.remove('recording');
-      micBtn.classList.add('processing');
-      busy = true;
-      stream.getTracks().forEach(t => t.stop());
-
-      try {
-        await processVoice(new Blob(chunks, { type: recMime }));
-      } catch (e) {
-        addMsg('system', '錯誤: ' + e.message);
-      } finally {
-        busy = false;
-        stopTimer();
-        micBtn.classList.remove('processing');
-        setPhase('點擊繼續對話', '');
-      }
+    recorder.ondataavailable = function(e) { if (e.data.size > 0) chunks.push(e.data); };
+    recorder.onstop = function() {
+      stream.getTracks().forEach(function(t) { t.stop(); });
+      process(new Blob(chunks, { type: recorder.mimeType }));
     };
+    recorder.start();
+    mic.classList.add('hold');
+    hint.textContent = '放開送出';
+    setPhase('錄音中…');
+  }).catch(function() { msg('s', '麥克風存取失敗'); });
+}
 
-    mediaRecorder.start();
-    micBtn.classList.add('recording');
-    setPhase('錄音中…', '再點一下停止');
-  } catch (e) {
-    addMsg('system', '麥克風存取失敗: ' + e.message);
+function stopRec() {
+  if (recorder && recorder.state === 'recording') {
+    recorder.stop();
+    mic.classList.remove('hold');
   }
 }
 
-async function processVoice(audioBlob) {
-  var wavBlob = audioBlob;
-  var ext = audioBlob.type.includes('mp4') ? 'mp4' : audioBlob.type.includes('webm') ? 'webm' : 'wav';
+async function process(blob) {
+  busy = true;
+  mic.classList.add('busy');
+  hint.textContent = '';
 
+  var wavBlob = blob;
+  var ext = blob.type.includes('mp4') ? 'mp4' : blob.type.includes('webm') ? 'webm' : 'wav';
   if (typeof AudioContext !== 'undefined') {
-    var audioCtx = null;
+    var ctx = null;
     try {
-      setPhase('轉換音訊…', '');
-      var arrayBuf = await audioBlob.arrayBuffer();
-      audioCtx = new AudioContext();
-      var decoded = await audioCtx.decodeAudioData(arrayBuf);
+      ctx = new AudioContext();
+      var decoded = await ctx.decodeAudioData(await blob.arrayBuffer());
       var pcm = decoded.getChannelData(0);
-      var wavBuf = encodeWAV(pcm, decoded.sampleRate);
-      wavBlob = new Blob([wavBuf], { type: 'audio/wav' });
+      wavBlob = new Blob([encodeWAV(pcm, decoded.sampleRate)], { type: 'audio/wav' });
       ext = 'wav';
-    } catch (e) {
-      console.warn('Client-side WAV conversion failed, sending raw audio:', e);
-      wavBlob = audioBlob;
-    } finally {
-      if (audioCtx) audioCtx.close();
-    }
+    } catch (e) {} finally { if (ctx) ctx.close(); }
   }
 
-  // Phase 1: STT
-  setPhase('語音辨識中…', (wavBlob.size / 1024).toFixed(0) + ' KB');
-  var sttForm = new FormData();
-  sttForm.append('file', wavBlob, 'voice.' + ext);
-  var sttRes = await fetch(getServer() + '/v1/audio/transcriptions?model=breeze-asr-25&language=zh', {
-    method: 'POST', body: sttForm
-  });
-  if (!sttRes.ok) throw new Error('STT 失敗: ' + sttRes.status);
-  var sttData = await sttRes.json();
-  const userText = sttData.text;
-  if (!userText || !userText.trim()) {
-    addMsg('system', '未偵測到語音');
-    return;
-  }
-  addMsg('user', userText);
-
-  // Phase 2: Immediate voice confirmation + dispatch
-  setPhase('青喵處理中…', '');
-  startTimer();
-
-  // Feedback uses separate audio channel — no racing with TTS
-  playFeedback(getServer() + '/voice/cached/ack');
-
-  var heartbeatTimer = setTimeout(function() {
-    setPhase('青喵處理中…', '查詢資料中');
-    playFeedback(getServer() + '/voice/cached/heartbeat');
-  }, HEARTBEAT_MS);
-
-  var timeoutTimer = setTimeout(function() {
-    setPhase('青喵處理中…', '背景處理');
-    playFeedback(getServer() + '/voice/cached/timeout');
-  }, TIMEOUT_WARNING_MS);
-
-  var t0 = Date.now();
-  var dispatchData;
+  // STT
+  setPhase('辨識中…');
+  var form = new FormData();
+  form.append('file', wavBlob, 'v.' + ext);
   try {
-    var ctrl = new AbortController();
-    var tid = setTimeout(function() { ctrl.abort(); }, ABORT_MS);
-    var dispatchRes = await fetch(getServer() + '/voice/dispatch', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: userText }),
-      signal: ctrl.signal,
+    var sttRes = await fetch(server + '/v1/audio/transcriptions?model=breeze-asr-25&language=zh', { method: 'POST', body: form });
+    var sttData = await sttRes.json();
+    if (!sttData.text || !sttData.text.trim()) { msg('s', '沒聽到'); done(); return; }
+    msg('u', sttData.text);
+  } catch (e) { msg('s', 'STT 失敗'); done(); return; }
+
+  // Dispatch with feedback
+  setPhase('青喵思考中…');
+  playFeedback('ack');
+  var hbTimer = setTimeout(function() { playFeedback('heartbeat'); }, 15000);
+  var toTimer = setTimeout(function() { playFeedback('timeout'); }, 60000);
+  var t0 = Date.now();
+
+  try {
+    var dRes = await fetch(server + '/voice/dispatch', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: sttData.text }),
     });
-    clearTimeout(tid);
-    dispatchData = await dispatchRes.json();
-  } catch (fetchErr) {
-    clearTimeout(heartbeatTimer);
-    clearTimeout(timeoutTimer);
-    stopFeedback();
-    addMsg('system', '連線中斷，請重試（' + fetchErr.message + '）');
-    return;
-  }
-  clearTimeout(heartbeatTimer);
-  clearTimeout(timeoutTimer);
-  stopFeedback();
-  var elapsed = ((Date.now() - t0) / 1000).toFixed(1);
-  stopTimer();
+    var dData = await dRes.json();
+    clearTimeout(hbTimer); clearTimeout(toTimer); stopFeedback();
+    var elapsed = ((Date.now() - t0) / 1000).toFixed(1);
 
-  if (dispatchData.timeout || !dispatchData.text) {
-    addMsg('system', '青喵未在時限內回覆 (' + elapsed + 's)');
-    return;
-  }
+    if (dData.timeout || !dData.text) { msg('s', '未在時限內回覆 (' + elapsed + 's)'); done(); return; }
+    msg('b', dData.text, elapsed + 's');
 
-  const botText = dispatchData.text;
-  addMsg('bot', botText, elapsed + 's');
-
-  // Phase 3: Sentence-level TTS — split and play progressively
-  var sentences = splitSentences(botText);
-  setPhase('語音合成中…', '0/' + sentences.length + ' 句');
-
-  for (var si = 0; si < sentences.length; si++) {
-    setPhase('播放中…', (si + 1) + '/' + sentences.length + ' 句');
-    try {
-      var ttsRes = await fetch(getServer() + '/v1/audio/speech', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ input: sentences[si], voice: 'Chelsie', model: 'qwen3-tts' }),
-      });
-      var ttsBlob = await ttsRes.blob();
-      var url = URL.createObjectURL(ttsBlob);
-      ttsAudio.src = url;
-      await ttsAudio.play();
-      await new Promise(function(resolve) { ttsAudio.onended = resolve; });
-      URL.revokeObjectURL(url);
-    } catch (e) {
-      console.warn('TTS sentence failed:', e);
+    // Sentence TTS
+    var sentences = splitSentences(dData.text);
+    for (var i = 0; i < sentences.length; i++) {
+      setPhase('播放 ' + (i + 1) + '/' + sentences.length);
+      try { await playTts(sentences[i]); } catch (e) {}
     }
+  } catch (e) {
+    clearTimeout(hbTimer); clearTimeout(toTimer); stopFeedback();
+    msg('s', '連線失敗');
   }
+  done();
 }
 
-$('serverUrl').addEventListener('change', checkHealth);
-checkHealth();
-addMsg('system', '語音對話就緒，點擊麥克風開始');
+function done() {
+  busy = false;
+  mic.classList.remove('busy');
+  hint.textContent = '按住說話';
+  setPhase('');
+}
+
+// Touch events (press and hold)
+mic.addEventListener('touchstart', function(e) { e.preventDefault(); startRec(); }, { passive: false });
+mic.addEventListener('touchend', function(e) { e.preventDefault(); stopRec(); });
+mic.addEventListener('touchcancel', function(e) { stopRec(); });
+// Mouse fallback
+mic.addEventListener('mousedown', function(e) { e.preventDefault(); startRec(); });
+mic.addEventListener('mouseup', function(e) { stopRec(); });
+mic.addEventListener('mouseleave', function(e) { stopRec(); });
+
+// Health check
+fetch(server + '/health').then(function(r) { return r.json(); }).then(function(d) {
+  dot.classList.add('on');
+  sub.textContent = d.stt_model.split('/').pop();
+}).catch(function() { sub.textContent = '離線'; });
+
+msg('s', '按住麥克風開始對話');
 </script>
