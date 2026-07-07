@@ -385,8 +385,10 @@ class ChatCompletionRequest(BaseModel):
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(req: ChatCompletionRequest):
+async def chat_completions(request: Request, req: ChatCompletionRequest):
     """OpenAI-compatible chat endpoint — injects into Claude Code session via voice plugin."""
+    if not _check_pin(request):
+        return JSONResponse({"error": "Invalid PIN"}, status_code=401)
     user_messages = [m["content"] for m in req.messages if m.get("role") == "user"]
     if not user_messages:
         return JSONResponse({"error": "No user message"}, status_code=400)
@@ -469,11 +471,8 @@ class VoiceDispatchRequest(BaseModel):
 def _check_pin(request) -> bool:
     """Validate 6-digit PIN from X-Voice-Pin header."""
     if not VOICE_PIN:
-        return True
+        return False
     return request.headers.get("x-voice-pin", "") == VOICE_PIN
-
-
-_pending_replies: dict[str, asyncio.Future] = {}
 
 
 async def _inject_to_plugin(text: str) -> dict:
@@ -540,8 +539,10 @@ class VoiceReplyCallback(BaseModel):
 
 
 @app.post("/voice/reply-callback")
-async def voice_reply_callback(req: VoiceReplyCallback):
+async def voice_reply_callback(request: Request, req: VoiceReplyCallback):
     """Receive Claude's voice reply from the voice channel plugin, trigger TTS."""
+    if not _check_pin(request):
+        return JSONResponse({"error": "Invalid PIN"}, status_code=401)
     if not req.text.strip():
         return JSONResponse({"error": "Empty reply"}, status_code=400)
 
@@ -551,11 +552,6 @@ async def voice_reply_callback(req: VoiceReplyCallback):
         asyncio.get_running_loop().run_in_executor(
             None, _discord_post_webhook, f"🫧 {req.text}", "青喵 (語音回覆)"
         )
-
-    if req.message_id and req.message_id in _pending_replies:
-        fut = _pending_replies.pop(req.message_id)
-        if not fut.done():
-            fut.set_result(req.text)
 
     return {"ok": True, "text_length": len(req.text)}
 
