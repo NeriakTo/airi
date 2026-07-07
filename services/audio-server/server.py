@@ -1,15 +1,20 @@
-"""MeowVoice 本地音訊服務 — TTS (Qwen3-TTS 1.7B MLX) + STT (mlx-whisper)
+"""MeowVoice 本地音訊服務 — TTS + STT + Voice Bridge
 
-AIRI Electron 透過 localhost HTTP 呼叫此服務。
-TTS 使用 SSE 串流回傳音訊 chunks，STT 接收 WAV 回傳文字。
+TTS: Qwen3-TTS 1.7B MLX, STT: mlx-whisper large-v3-turbo
+Voice Bridge: 語音文字 → Discord webhook → 輪詢 CyanMeow 回覆 → TTS
 """
 
 import io
 import os
+import re
+import json
 import time
 import wave
+import asyncio
 import tempfile
 import logging
+import urllib.request
+import urllib.error
 from contextlib import asynccontextmanager
 
 import ssl
@@ -24,6 +29,19 @@ from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 logger = logging.getLogger("meowvoice-audio")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
+
+def _load_dotenv():
+    env_file = Path(__file__).parent / ".env"
+    if env_file.exists():
+        for line in env_file.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, val = line.split("=", 1)
+                os.environ.setdefault(key.strip(), val.strip())
+
+
+_load_dotenv()
+
 TTS_MODEL_ID = os.environ.get(
     "MEOWVOICE_TTS_MODEL",
     "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16",
@@ -35,6 +53,55 @@ STT_MODEL_ID = os.environ.get(
 TTS_VOICE = os.environ.get("MEOWVOICE_TTS_VOICE", "Chelsie")
 HOST = os.environ.get("MEOWVOICE_HOST", "127.0.0.1")
 PORT = int(os.environ.get("MEOWVOICE_PORT", "8400"))
+
+DISCORD_WEBHOOK = os.environ.get("MEOWVOICE_DISCORD_WEBHOOK", "")
+VOICE_CHANNEL_ID = os.environ.get("MEOWVOICE_VOICE_CHANNEL_ID", "1475645959542145166")
+CYANMEOW_BOT_ID = os.environ.get("MEOWVOICE_CYANMEOW_BOT_ID", "1490193787463532724")
+DISPATCH_TIMEOUT = int(os.environ.get("MEOWVOICE_DISPATCH_TIMEOUT", "120"))
+
+def _load_discord_bot_token() -> str:
+    token = os.environ.get("MEOWVOICE_DISCORD_BOT_TOKEN", "")
+    if token:
+        return token
+    token_file = os.environ.get("MEOWVOICE_DISCORD_BOT_TOKEN_FILE", "")
+    if token_file and Path(token_file).exists():
+        for line in Path(token_file).read_text().splitlines():
+            if line.startswith("DISCORD_BOT_TOKEN="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return ""
+
+DISCORD_BOT_TOKEN = _load_discord_bot_token()
+
+CHANNEL_ROUTES: list[tuple[list[str], str]] = [
+    (["triclaw", "openclaw", "三爪"], "1486183810143097093"),
+    (["連線", "linknet", "mes"], "1480803774116266110"),
+    (["全有", "forecast"], "1489111296103288952"),
+    (["印比雅", "鉅茂", "itec"], "1511980894246801538"),
+    (["dg+", "dg plus"], "1504401236349157547"),
+    (["三菱", "電梯", "facteye"], "1521075633441214566"),
+    (["六哥"], "1519927940866117732"),
+    (["紡織雲", "itextiles"], "1514862156401610752"),
+    (["昕鈺", "bom"], "1485467155456589954"),
+    (["科治"], "1488554316452073493"),
+    (["鏈騏", "貴金屬"], "1508364794804047913"),
+    (["車牌"], "1477308834128068741"),
+    (["雲市集", "工業館"], "1478288192250843289"),
+    (["鼎洰", "ems"], "1498531961797480469"),
+    (["140d"], "1521093790197219478"),
+    (["來永", "ai hr", "招聘"], "1475786438397132801"),
+    (["帝寶", "物業"], "1489613734581374976"),
+    (["章治", "rdt"], "1499551630914486283"),
+    (["聯祥", "eqa"], "1484010621090402383"),
+    (["鴻法", "sbir"], "1516963879702237245"),
+    (["品牌", "blog", "nerigate"], "1475418652173008919"),
+    (["家庭", "kelly", "feon"], "1520224473016566011"),
+    (["gx10 建置", "gx10 規劃"], "1523300651092672622"),
+    (["gx10", "a100", "azure"], "1505045689351147631"),
+    (["fortigate", "70d"], "1520807144234942494"),
+    (["呼嚕嚕", "purr"], "1504786668849201262"),
+    (["威益"], "1487269649732341770"),
+    (["富永"], "1475782950246420611"),
+]
 
 tts_model = None
 stt_model_id = None
@@ -63,13 +130,18 @@ def load_stt():
 async def lifespan(app: FastAPI):
     load_tts()
     load_stt()
-    logger.info("Audio server ready on %s:%d", HOST, PORT)
+    voice_ok = bool(DISCORD_WEBHOOK and DISCORD_BOT_TOKEN)
+    logger.info("Audio server ready on %s:%d (voice_bridge=%s)", HOST, PORT, voice_ok)
     yield
     logger.info("Audio server shutting down")
 
 
 app = FastAPI(title="MeowVoice Audio Server", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+ALLOWED_ORIGINS = os.environ.get(
+    "MEOWVOICE_CORS_ORIGINS",
+    "http://localhost:5173,http://127.0.0.1:5173,https://127.0.0.1:8400",
+).split(",")
+app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_methods=["*"], allow_headers=["*"])
 
 SSL_CERT = os.environ.get("MEOWVOICE_SSL_CERT", "/tmp/meowvoice-cert.pem")
 SSL_KEY = os.environ.get("MEOWVOICE_SSL_KEY", "/tmp/meowvoice-key.pem")
@@ -87,7 +159,7 @@ async def health():
     }
 
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 class TtsRequest(BaseModel):
     text: str
@@ -137,30 +209,29 @@ async def tts_generate(req: TtsRequest):
             headers={"X-Sample-Rate": str(model.sample_rate)},
         )
     else:
-        chunks = []
-        for result in model.generate(
-            text=text,
-            voice=voice,
-            lang_code=lang,
-            verbose=False,
-            stream=False,
-        ):
-            if hasattr(result, "audio"):
-                chunks.append(np.array(result.audio))
+        def _generate_full():
+            audio_chunks = []
+            for result in model.generate(
+                text=text, voice=voice, lang_code=lang, verbose=False, stream=False,
+            ):
+                if hasattr(result, "audio"):
+                    audio_chunks.append(np.array(result.audio))
+            if not audio_chunks:
+                return None
+            full_audio = np.concatenate(audio_chunks)
+            audio_int16 = (full_audio * 32767).astype(np.int16)
+            buf = io.BytesIO()
+            with wave.open(buf, "w") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(model.sample_rate)
+                wf.writeframes(audio_int16.tobytes())
+            buf.seek(0)
+            return buf
 
-        if not chunks:
+        buf = await asyncio.to_thread(_generate_full)
+        if buf is None:
             return JSONResponse({"error": "No audio generated"}, status_code=500)
-
-        full_audio = np.concatenate(chunks)
-        audio_int16 = (full_audio * 32767).astype(np.int16)
-
-        buf = io.BytesIO()
-        with wave.open(buf, "w") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(model.sample_rate)
-            wf.writeframes(audio_int16.tobytes())
-        buf.seek(0)
 
         logger.info("TTS done: text=%r time=%.2fs", text[:30], time.time() - t_start)
         return StreamingResponse(buf, media_type="audio/wav")
@@ -172,7 +243,7 @@ async def stt_transcribe(
     lang: str = Query(default="zh", description="Language hint"),
 ):
     """Transcribe audio to text using mlx-whisper."""
-    import mlx_whisper
+    import mlx_whisper  # noqa: E402 — lazy import to avoid load at startup
 
     t_start = time.time()
 
@@ -182,14 +253,19 @@ async def stt_transcribe(
         tmp_path = tmp.name
 
     try:
-        result = mlx_whisper.transcribe(
-            tmp_path,
-            path_or_hf_repo=stt_model_id,
-            language=lang,
-            verbose=False,
-            initial_prompt="以下是繁體中文語音內容的轉錄。青喵、灰喵、黑喵、貓爪、小野是 AI 助手的名字。",
-            condition_on_previous_text=False,
-        )
+        import asyncio
+
+        def _transcribe():
+            return mlx_whisper.transcribe(
+                tmp_path,
+                path_or_hf_repo=stt_model_id,
+                language=lang,
+                verbose=False,
+                initial_prompt="以下是繁體中文語音內容的轉錄。青喵、灰喵、黑喵、貓爪、小野是 AI 助手的名字。",
+                condition_on_previous_text=False,
+            )
+
+        result = await asyncio.to_thread(_transcribe)
         text = result.get("text", "").strip()
         duration = time.time() - t_start
         logger.info("STT done: text=%r time=%.2fs", text[:50], duration)
@@ -236,9 +312,122 @@ async def openai_transcriptions(
     return {"text": result["text"]}
 
 
+def _route_prefix(text: str) -> tuple[str, str]:
+    """Parse prefix from text and return (routed_channel_id, cleaned_text)."""
+    lower = text.lower().strip()
+    for prefixes, channel_id in CHANNEL_ROUTES:
+        for prefix in prefixes:
+            if lower.startswith(prefix):
+                rest = text.strip()[len(prefix):].strip().lstrip("，,、：:").strip()
+                if rest:
+                    return channel_id, rest
+                return channel_id, text.strip()
+    return VOICE_CHANNEL_ID, text.strip()
+
+
+def _discord_post_webhook(text: str, username: str = "🎙️ Kevin (語音)") -> dict | None:
+    """Post a message via Discord webhook. Returns the created message."""
+    if not DISCORD_WEBHOOK:
+        return None
+    url = DISCORD_WEBHOOK + "?wait=true"
+    data = json.dumps({"content": text, "username": username}).encode()
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read())
+    except Exception as e:
+        logger.error("Webhook post failed: %s", e)
+        return None
+
+
+def _discord_fetch_replies(channel_id: str, after_id: str) -> list[dict]:
+    """Fetch messages in a channel after a given message ID."""
+    if not DISCORD_BOT_TOKEN:
+        return []
+    url = f"https://discord.com/api/v10/channels/{channel_id}/messages?after={after_id}&limit=20"
+    req = urllib.request.Request(url, headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read())
+    except Exception as e:
+        logger.error("Discord fetch failed: %s", e)
+        return []
+
+
+class VoiceDispatchRequest(BaseModel):
+    text: str
+    channel_hint: str = ""
+
+
+_dispatch_lock = asyncio.Lock()
+
+# NOTICE: POC 架構 — webhook 直送 + Discord REST 輪詢。
+# E-lite 正式架構為 TriClaw daemon /api/voice-input + SSE 訂閱（V1-V4 待實作）。
+
+@app.post("/voice/dispatch")
+async def voice_dispatch(req: VoiceDispatchRequest):
+    """Send voice text to Discord and wait for CyanMeow's reply."""
+    if not DISCORD_WEBHOOK:
+        return JSONResponse({"error": "MEOWVOICE_DISCORD_WEBHOOK not configured"}, status_code=503)
+    if not DISCORD_BOT_TOKEN:
+        return JSONResponse({"error": "Discord bot token not configured"}, status_code=503)
+
+    async with _dispatch_lock:
+        return await _do_dispatch(req)
+
+
+async def _do_dispatch(req: VoiceDispatchRequest) -> dict:
+    target_channel, cleaned = _route_prefix(req.text)
+    if req.channel_hint:
+        target_channel = req.channel_hint
+
+    display_text = cleaned
+    if target_channel != VOICE_CHANNEL_ID:
+        display_text = f"[→ <#{target_channel}>] {cleaned}"
+
+    msg = await asyncio.to_thread(_discord_post_webhook, display_text)
+    if not msg or "id" not in msg:
+        return JSONResponse({"error": "Failed to post to Discord"}, status_code=502)
+
+    posted_id = msg["id"]
+    logger.info("Voice dispatched: text=%r context=%s msg_id=%s", cleaned[:40], target_channel, posted_id)
+
+    t_start = time.time()
+    collected: list[str] = []
+    first_reply_at: float | None = None
+
+    while time.time() - t_start < DISPATCH_TIMEOUT:
+        await asyncio.sleep(2)
+        messages = await asyncio.to_thread(_discord_fetch_replies, VOICE_CHANNEL_ID, posted_id)
+        # Discord GET messages?after= returns newest-first; reverse to process oldest-first
+        messages.reverse()
+
+        for m in messages:
+            author = m.get("author", {})
+            content = m.get("content", "").strip()
+            if author.get("id") == CYANMEOW_BOT_ID and content:
+                mid = m.get("id")
+                if mid not in [c[0] for c in collected]:
+                    collected.append((mid, content))
+                    if first_reply_at is None:
+                        first_reply_at = time.time()
+
+        if first_reply_at is not None and time.time() - first_reply_at > 4:
+            break
+
+    elapsed = time.time() - t_start
+    if not collected:
+        logger.warning("Voice dispatch timeout after %.1fs", elapsed)
+        return JSONResponse({"text": "", "timeout": True, "elapsed": elapsed})
+
+    reply_text = "\n\n".join(text for _, text in collected)
+    logger.info("Voice reply received: %d parts, text=%r elapsed=%.1fs", len(collected), reply_text[:50], elapsed)
+    return {"text": reply_text, "timeout": False, "elapsed": elapsed}
+
+
 @app.get("/test", response_class=HTMLResponse)
 async def test_page():
-    """Browser-based voice test page for mobile/desktop."""
+    """Browser-based voice test/conversation page for mobile/desktop."""
     if TEST_PAGE.exists():
         return HTMLResponse(TEST_PAGE.read_text(encoding="utf-8"))
     return HTMLResponse("<h1>test-page.html not found</h1>", status_code=404)

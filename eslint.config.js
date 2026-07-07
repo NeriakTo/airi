@@ -27,6 +27,7 @@ export default defineConfig({
     '**/.astro/**',
     '.agents/**',
     '.github/**',
+    'services/**',
     'CLAUDE.md', // Skip the symbolic link
   ],
 }, {

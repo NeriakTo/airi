@@ -140,3 +140,5 @@ apps/stage-tamagotchi/electron.vite.config.*.mjs
 
 docs/ai/context/verifications/
 .playwright-mcp/
+.env
+services/audio-server/.env
