@@ -105,6 +105,7 @@
 <script>
 var server = window.location.origin;
 var pin = sessionStorage.getItem('meowvoice_pin') || '';
+var hasSession = false;
 var dot = document.getElementById('dot');
 var sub = document.getElementById('sub');
 var chat = document.getElementById('chat');
@@ -119,12 +120,14 @@ var pinErr = document.getElementById('pinErr');
 var cancelHint = document.getElementById('cancelHint');
 var busy = false;
 var recorder = null;
+var micStream = null;
 var chunks = [];
 var touchStartY = 0;
 var cancelThreshold = 80;
 var isCancelled = false;
 
 function pinHeaders() {
+  if (hasSession) return {};
   return { 'X-Voice-Pin': pin };
 }
 
@@ -162,8 +165,19 @@ function stopFeedback() { fbEl.pause(); fbEl.src = ''; }
 // --- PIN validation ---
 function checkStoredPin() {
   if (pin && pin.length === 6) {
-    fetch(server + '/health').then(function(r) { return r.json(); }).then(function() {
-      unlockMic();
+    fetch(server + '/voice/auth', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pin: pin }),
+      credentials: 'include',
+    }).then(function(r) {
+      if (r.ok) {
+        hasSession = true;
+        unlockMic();
+        initMic();
+      } else {
+        showPinScreen();
+      }
     }).catch(function() {
       showPinScreen();
     });
@@ -188,30 +202,47 @@ pinInput.addEventListener('input', function() {
   pinErr.textContent = '';
   if (pinInput.value.length === 6) {
     pin = pinInput.value;
-    // Validate PIN by calling health with pin header (stt requires pin)
-    var form = new FormData();
-    form.append('file', new Blob([new ArrayBuffer(44)], { type: 'audio/wav' }), 'test.wav');
-    fetch(server + '/stt', { method: 'POST', body: form, headers: pinHeaders() })
-      .then(function(r) {
-        if (r.status === 401) {
-          pinErr.textContent = 'PIN 錯誤';
-          pin = '';
-        } else {
-          sessionStorage.setItem('meowvoice_pin', pin);
-          unlockMic();
-          msg('s', '驗證成功，按住麥克風說話');
-        }
-      }).catch(function() {
+    fetch(server + '/voice/auth', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pin: pin }),
+      credentials: 'include',
+    }).then(function(r) {
+      if (r.status === 401) {
+        pinErr.textContent = 'PIN 錯誤';
+        pin = '';
+      } else if (r.status === 429) {
+        pinErr.textContent = '嘗試次數過多，請稍後再試';
+        pin = '';
+      } else if (r.ok) {
+        hasSession = true;
+        sessionStorage.setItem('meowvoice_pin', pin);
+        unlockMic();
+        initMic();
+        msg('s', '驗證成功，按住麥克風說話');
+      } else {
         pinErr.textContent = '連線失敗';
         pin = '';
-      });
+      }
+    }).catch(function() {
+      pinErr.textContent = '連線失敗';
+      pin = '';
+    });
   }
 });
+
+// --- Mic stream management (request permission once, keep stream alive) ---
+function initMic() {
+  if (micStream) return;
+  navigator.mediaDevices.getUserMedia({ audio: true }).then(function(stream) {
+    micStream = stream;
+  }).catch(function() {});
+}
 
 // --- Press-and-hold recording ---
 function startRec() {
   if (busy || !pin) return;
-  navigator.mediaDevices.getUserMedia({ audio: true }).then(function(stream) {
+  function beginRecording(stream) {
     var mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
       ? 'audio/webm;codecs=opus'
       : MediaRecorder.isTypeSupported('audio/mp4') ? 'audio/mp4' : '';
@@ -219,7 +250,6 @@ function startRec() {
     chunks = [];
     recorder.ondataavailable = function(e) { if (e.data.size > 0) chunks.push(e.data); };
     recorder.onstop = function() {
-      stream.getTracks().forEach(function(t) { t.stop(); });
       if (isCancelled) {
         isCancelled = false;
         msg('s', '已取消錄音');
@@ -232,7 +262,15 @@ function startRec() {
     mic.classList.add('hold');
     hint.textContent = '放開送出';
     setPhase('錄音中…');
-  }).catch(function() { msg('s', '麥克風存取失敗'); });
+  }
+  if (micStream && micStream.active) {
+    beginRecording(micStream);
+  } else {
+    navigator.mediaDevices.getUserMedia({ audio: true }).then(function(stream) {
+      micStream = stream;
+      beginRecording(stream);
+    }).catch(function() { msg('s', '麥克風存取失敗'); });
+  }
 }
 
 function stopRec() {
@@ -292,7 +330,7 @@ async function process(blob) {
   form.append('file', wavBlob, 'v.' + ext);
   try {
     var sttRes = await fetch(server + '/v1/audio/transcriptions?model=breeze-asr-25&language=zh', {
-      method: 'POST', body: form, headers: pinHeaders(),
+      method: 'POST', body: form, headers: pinHeaders(), credentials: 'include',
     });
     if (sttRes.status === 401) { msg('s', 'PIN 驗證失敗'); showPinScreen(); done(); return; }
     var sttData = await sttRes.json();
@@ -309,6 +347,7 @@ async function process(blob) {
       method: 'POST',
       headers: Object.assign({ 'Content-Type': 'application/json' }, pinHeaders()),
       body: JSON.stringify({ text: sttData.text }),
+      credentials: 'include',
     });
     if (dRes.status === 401) { msg('s', 'PIN 驗證失敗'); stopFeedback(); showPinScreen(); done(); return; }
     var dData = await dRes.json();
@@ -333,7 +372,7 @@ async function pollReply(messageId) {
   for (var i = 0; i < 60; i++) {
     await new Promise(function(r) { setTimeout(r, 2000); });
     try {
-      var res = await fetch(server + '/voice/reply/' + messageId, { headers: pinHeaders() });
+      var res = await fetch(server + '/voice/reply/' + messageId, { headers: pinHeaders(), credentials: 'include' });
       var data = await res.json();
       if (data.status === 'ready') {
         msg('b', data.text);
@@ -341,7 +380,7 @@ async function pollReply(messageId) {
         try {
           var ttsRes = await fetch(server + '/tts', {
             method: 'POST',
-            headers: Object.assign({ 'Content-Type': 'application/json' }, pinHeaders()),
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ text: data.text }),
           });
           if (ttsRes.ok) {

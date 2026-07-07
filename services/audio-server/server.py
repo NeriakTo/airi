@@ -60,6 +60,7 @@ VOICE_CHANNEL_ID = os.environ.get("MEOWVOICE_VOICE_CHANNEL_ID", "147564595954214
 CYANMEOW_BOT_ID = os.environ.get("MEOWVOICE_CYANMEOW_BOT_ID", "1490193787463532724")
 DISPATCH_TIMEOUT = int(os.environ.get("MEOWVOICE_DISPATCH_TIMEOUT", "60"))
 VOICE_PIN = os.environ.get("MEOWVOICE_PIN", "")
+_BRIDGE_PIN = VOICE_PIN  # kept for localhost bridge auth after _init_pin_storage clears VOICE_PIN
 VOICE_PLUGIN_URL = os.environ.get("MEOWVOICE_VOICE_PLUGIN", "http://127.0.0.1:8401")
 
 # --- PIN security infrastructure ---
@@ -614,7 +615,7 @@ async def _dispatch_to_runtime(text: str, runtime_id: str | None = None) -> dict
         resp = await _http_client.post(
             runtime["url"],
             json={"text": text, "callback_url": callback_url, "user": "Kevin"},
-            headers={"X-Voice-Pin": VOICE_PIN},
+            headers={"X-Voice-Pin": _BRIDGE_PIN},
         )
         result = resp.json()
         result["runtime"] = runtime_id
@@ -632,7 +633,7 @@ async def _inject_legacy(text: str) -> dict:
         resp = await _http_client.post(
             f"{VOICE_PLUGIN_URL}/inject",
             json={"text": text},
-            headers={"X-Voice-Pin": VOICE_PIN},
+            headers={"X-Voice-Pin": _BRIDGE_PIN},
         )
         return resp.json()
     except Exception as e:
@@ -654,9 +655,6 @@ async def voice_dispatch(request: Request, req: VoiceDispatchRequest):
     if target_channel != VOICE_CHANNEL_ID:
         display_text = f"[→ <#{target_channel}>] {cleaned}"
 
-    if DISCORD_WEBHOOK:
-        asyncio.create_task(_discord_post_webhook(display_text))
-
     logger.info("Voice inject: text=%r", cleaned[:60])
     t_start = time.time()
 
@@ -666,6 +664,9 @@ async def voice_dispatch(request: Request, req: VoiceDispatchRequest):
     if "error" in result:
         logger.warning("Voice inject failed after %.1fs: %s", elapsed, result["error"])
         return JSONResponse({"injected": False, "error": result["error"], "elapsed": elapsed})
+
+    if DISCORD_WEBHOOK:
+        asyncio.create_task(_discord_post_webhook(display_text))
 
     message_id = result.get("message_id", "")
     logger.info("Voice injected: message_id=%s elapsed=%.1fs", message_id, elapsed)
