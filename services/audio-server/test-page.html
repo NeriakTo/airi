@@ -68,11 +68,13 @@
     border-radius: 6px; background: var(--bg); color: var(--text); outline: none; width: 100%; margin-top: 0.2rem; margin-bottom: 0.5rem; }
   .config-panel input:focus { border-color: var(--cyan); }
 
+  .timer { font-family: var(--mono); font-size: 0.7rem; color: var(--cyan); font-variant-numeric: tabular-nums; }
+
   audio { display: none; }
 </style>
 
 <div class="header">
-  <h1><span class="dot" id="dot"></span> MeowVoice</h1>
+  <h1><span class="dot" id="dot"></span> MeowVoice <span style="font-size:0.7rem;color:var(--text-muted);font-weight:400">E-lite V2</span></h1>
   <div class="status-text" id="statusText">connecting...</div>
 </div>
 
@@ -91,6 +93,7 @@
     <div class="phase" id="phaseText">點擊開始對話</div>
     <div id="phaseDetail"></div>
   </div>
+  <span class="timer" id="timer"></span>
   <span class="config-toggle" onclick="document.getElementById('configPanel').classList.toggle('open')">&#9881;</span>
 </div>
 
@@ -103,12 +106,14 @@ const statusText = $('statusText');
 const micBtn = $('micBtn');
 const phaseText = $('phaseText');
 const phaseDetail = $('phaseDetail');
+const timerEl = $('timer');
 const chatEl = $('chat');
 const ttsAudio = $('ttsAudio');
 
 let mediaRecorder = null;
 let chunks = [];
 let busy = false;
+let dispatchTimer = null;
 
 function getServer() { return $('serverUrl').value.trim().replace(/\/+$/, '') || window.location.origin; }
 
@@ -132,12 +137,46 @@ function setPhase(phase, detail) {
   phaseDetail.textContent = detail || '';
 }
 
+function startTimer() {
+  const t0 = Date.now();
+  dispatchTimer = setInterval(function() {
+    const s = ((Date.now() - t0) / 1000).toFixed(0);
+    timerEl.textContent = s + 's';
+  }, 500);
+}
+
+function stopTimer() {
+  if (dispatchTimer) { clearInterval(dispatchTimer); dispatchTimer = null; }
+  timerEl.textContent = '';
+}
+
+async function playAudioUrl(url) {
+  const res = await fetch(url);
+  const blob = await res.blob();
+  const objUrl = URL.createObjectURL(blob);
+  ttsAudio.src = objUrl;
+  await ttsAudio.play();
+  await new Promise(resolve => { ttsAudio.onended = resolve; });
+  URL.revokeObjectURL(objUrl);
+}
+
+function splitSentences(text) {
+  var parts = text.split(/(?<=[。！？!?\n])/);
+  var sentences = [];
+  for (var i = 0; i < parts.length; i++) {
+    var s = parts[i].trim();
+    if (s) sentences.push(s);
+  }
+  if (sentences.length === 0 && text.trim()) sentences.push(text.trim());
+  return sentences;
+}
+
 async function checkHealth() {
   try {
     const res = await fetch(getServer() + '/health');
     const data = await res.json();
     dot.classList.add('online');
-    statusText.textContent = data.tts_model.split('/').pop() + ' · ' + data.stt_model.split('/').pop();
+    statusText.textContent = data.tts_model.split('/').pop() + ' + ' + data.stt_model.split('/').pop();
   } catch (e) {
     dot.classList.remove('online');
     statusText.textContent = '無法連線';
@@ -192,6 +231,7 @@ async function toggleVoice() {
         addMsg('system', '錯誤: ' + e.message);
       } finally {
         busy = false;
+        stopTimer();
         micBtn.classList.remove('processing');
         setPhase('點擊繼續對話', '');
       }
@@ -209,7 +249,6 @@ async function processVoice(audioBlob) {
   var wavBlob = audioBlob;
   var ext = audioBlob.type.includes('mp4') ? 'mp4' : audioBlob.type.includes('webm') ? 'webm' : 'wav';
 
-  // Try client-side WAV conversion; if it fails (iOS Safari), send raw blob
   if (typeof AudioContext !== 'undefined') {
     try {
       setPhase('轉換音訊…', '');
@@ -227,6 +266,7 @@ async function processVoice(audioBlob) {
     }
   }
 
+  // Phase 1: STT
   setPhase('語音辨識中…', (wavBlob.size / 1024).toFixed(0) + ' KB');
   var sttForm = new FormData();
   sttForm.append('file', wavBlob, 'voice.' + ext);
@@ -242,13 +282,37 @@ async function processVoice(audioBlob) {
   }
   addMsg('user', userText);
 
-  setPhase('傳送給青喵…', '等待回覆中（約 10-30 秒）');
+  // Phase 2: Immediate voice confirmation + dispatch
+  setPhase('青喵處理中…', '');
+  startTimer();
+
+  // Play cached "ack" immediately while dispatch runs
+  var ackPlayed = false;
+  var heartbeatTimer = null;
+  var timeoutTimer = null;
+
+  var ackPromise = playAudioUrl(getServer() + '/voice/cached/ack').then(function() {
+    ackPlayed = true;
+  }).catch(function() {});
+
+  // Heartbeat at 15s
+  heartbeatTimer = setTimeout(function() {
+    setPhase('青喵處理中…', '查詢資料中');
+    playAudioUrl(getServer() + '/voice/cached/heartbeat').catch(function() {});
+  }, 15000);
+
+  // Timeout warning at 60s
+  timeoutTimer = setTimeout(function() {
+    setPhase('青喵處理中…', '背景處理');
+    playAudioUrl(getServer() + '/voice/cached/timeout').catch(function() {});
+  }, 60000);
+
   const t0 = Date.now();
-  var dispatchRes, dispatchData;
+  var dispatchData;
   try {
     var ctrl = new AbortController();
-    var tid = setTimeout(function() { ctrl.abort(); }, 120000);
-    dispatchRes = await fetch(getServer() + '/voice/dispatch', {
+    var tid = setTimeout(function() { ctrl.abort(); }, 180000);
+    var dispatchRes = await fetch(getServer() + '/voice/dispatch', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text: userText }),
@@ -257,10 +321,15 @@ async function processVoice(audioBlob) {
     clearTimeout(tid);
     dispatchData = await dispatchRes.json();
   } catch (fetchErr) {
+    clearTimeout(heartbeatTimer);
+    clearTimeout(timeoutTimer);
     addMsg('system', '連線中斷，請重試（' + fetchErr.message + '）');
     return;
   }
+  clearTimeout(heartbeatTimer);
+  clearTimeout(timeoutTimer);
   const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+  stopTimer();
 
   if (dispatchData.timeout || !dispatchData.text) {
     addMsg('system', '青喵未在時限內回覆 (' + elapsed + 's)');
@@ -270,21 +339,27 @@ async function processVoice(audioBlob) {
   const botText = dispatchData.text;
   addMsg('bot', botText, elapsed + 's');
 
-  setPhase('語音合成中…', '');
-  try {
-    const ttsRes = await fetch(getServer() + '/v1/audio/speech', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ input: botText, voice: 'Chelsie', model: 'qwen3-tts' }),
-    });
-    const ttsBlob = await ttsRes.blob();
-    const url = URL.createObjectURL(ttsBlob);
-    ttsAudio.src = url;
-    setPhase('播放中…', '');
-    await ttsAudio.play();
-    await new Promise(resolve => { ttsAudio.onended = resolve; });
-  } catch (e) {
-    console.warn('TTS playback failed:', e);
+  // Phase 3: Sentence-level TTS — split and play progressively
+  var sentences = splitSentences(botText);
+  setPhase('語音合成中…', '0/' + sentences.length + ' 句');
+
+  for (var si = 0; si < sentences.length; si++) {
+    setPhase('播放中…', (si + 1) + '/' + sentences.length + ' 句');
+    try {
+      var ttsRes = await fetch(getServer() + '/v1/audio/speech', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ input: sentences[si], voice: 'Chelsie', model: 'qwen3-tts' }),
+      });
+      var ttsBlob = await ttsRes.blob();
+      var url = URL.createObjectURL(ttsBlob);
+      ttsAudio.src = url;
+      await ttsAudio.play();
+      await new Promise(function(resolve) { ttsAudio.onended = resolve; });
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      console.warn('TTS sentence failed:', e);
+    }
   }
 }
 

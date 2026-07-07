@@ -159,12 +159,48 @@ def load_stt():
     return stt_model_id
 
 
+CACHED_PHRASES: dict[str, str] = {
+    "ack": "收到了，正在處理。",
+    "heartbeat": "還在處理中，請稍候。",
+    "timeout": "這個問題需要多一點時間，已排入背景處理。",
+}
+_voice_cache: dict[str, bytes] = {}
+
+
+def _generate_cached_voices() -> None:
+    """Pre-generate standard voice feedback phrases at startup."""
+    model = load_tts()
+    for key, phrase in CACHED_PHRASES.items():
+        t0 = time.time()
+        audio_chunks = []
+        for result in model.generate(
+            text=phrase, voice=TTS_VOICE, lang_code="zh",
+            verbose=False, stream=False,
+        ):
+            if hasattr(result, "audio"):
+                audio_chunks.append(np.array(result.audio))
+        if not audio_chunks:
+            logger.warning("Failed to pre-cache voice: %s", key)
+            continue
+        full = np.concatenate(audio_chunks)
+        audio_int16 = (full * 32767).astype(np.int16)
+        buf = io.BytesIO()
+        with wave.open(buf, "w") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(model.sample_rate)
+            wf.writeframes(audio_int16.tobytes())
+        _voice_cache[key] = buf.getvalue()
+        logger.info("Cached voice '%s': %d bytes, %.1fs", key, len(_voice_cache[key]), time.time() - t0)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     load_tts()
     load_stt()
+    _generate_cached_voices()
     voice_ok = bool(DISCORD_WEBHOOK and DISCORD_BOT_TOKEN)
-    logger.info("Audio server ready on %s:%d (voice_bridge=%s)", HOST, PORT, voice_ok)
+    logger.info("Audio server ready on %s:%d (voice_bridge=%s, cached=%d)", HOST, PORT, voice_ok, len(_voice_cache))
     yield
     logger.info("Audio server shutting down")
 
@@ -461,6 +497,25 @@ async def _do_dispatch(req: VoiceDispatchRequest) -> dict:
 
     logger.info("Voice reply: text=%r elapsed=%.1fs", reply_text[:50], elapsed)
     return {"text": reply_text, "timeout": False, "elapsed": elapsed}
+
+
+@app.get("/voice/cached/{key}")
+async def cached_voice(key: str):
+    """Serve pre-cached voice feedback (ack/heartbeat/timeout)."""
+    data = _voice_cache.get(key)
+    if not data:
+        return JSONResponse({"error": f"No cached voice: {key}"}, status_code=404)
+    return StreamingResponse(io.BytesIO(data), media_type="audio/wav")
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Split text into sentences for progressive TTS."""
+    import re as _re
+    parts = _re.split(r"(?<=[。！？!?\n])", text)
+    sentences = [s.strip() for s in parts if s.strip()]
+    if not sentences and text.strip():
+        sentences = [text.strip()]
+    return sentences
 
 
 @app.get("/test", response_class=HTMLResponse)
