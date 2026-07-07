@@ -1,11 +1,12 @@
-"""MeowVoice 本地音訊服務 — TTS + STT + Voice Bridge
+"""MeowVoice 本地音訊服務 — TTS + STT + Voice Bridge (E-lite V2)
 
-TTS: Qwen3-TTS 1.7B MLX, STT: mlx-whisper large-v3-turbo
-Voice Bridge: 語音文字 → Discord webhook → 輪詢 CyanMeow 回覆 → TTS
+TTS: Qwen3-TTS 1.7B MLX, STT: Breeze-ASR-25 (MediaTek 台灣華語微調)
+Voice Bridge: 語音文字 → TriClaw runtime dispatch → TTS
 """
 
 import io
 import os
+import re
 import json
 import time
 import wave
@@ -138,6 +139,7 @@ def build_stt_prompt(channel_id: str = "") -> str:
 
 tts_model = None
 stt_model_id = None
+_mlx_lock = asyncio.Lock()
 
 
 def load_tts():
@@ -234,11 +236,17 @@ class TtsRequest(BaseModel):
     text: str
     voice: str = TTS_VOICE
     lang: str = "zh"
-    stream: bool = True
+    # stream 保留供 model.generate() 內部分段用，HTTP 回應一律為完整 WAV
+    stream: bool = False
 
 @app.post("/tts")
 async def tts_generate(req: TtsRequest):
-    """Generate speech from text. Returns WAV audio (streaming via chunked transfer)."""
+    """Generate speech from text. Returns WAV audio."""
+    async with _mlx_lock:
+        return await _tts_generate_inner(req)
+
+
+async def _tts_generate_inner(req: TtsRequest):
     model = load_tts()
     text, voice, lang, stream = req.text, req.voice, req.lang, req.stream
     t_start = time.time()
@@ -297,14 +305,16 @@ async def stt_transcribe(
 
     try:
         prompt = build_stt_prompt(channel_id)
-        result = mlx_whisper.transcribe(
-            tmp_path,
-            path_or_hf_repo=stt_model_id,
-            language=lang,
-            verbose=False,
-            initial_prompt=prompt,
-            condition_on_previous_text=True,
-        )
+        async with _mlx_lock:
+            result = mlx_whisper.transcribe(
+                tmp_path,
+                path_or_hf_repo=stt_model_id,
+                language=lang,
+                verbose=False,
+                initial_prompt=prompt,
+                # Breeze-ASR-25 短語音場景 True 可提升連貫性；長錄音有幻覺傳播風險
+                condition_on_previous_text=True,
+            )
         text = result.get("text", "").strip()
         duration = time.time() - t_start
         logger.info("STT done: text=%r time=%.2fs prompt_channel=%s", text[:50], duration, channel_id or "default")
@@ -412,17 +422,18 @@ TRICLAW_BINARY = os.environ.get("MEOWVOICE_TRICLAW_BINARY", "triclaw")
 TRICLAW_RUNTIME = os.environ.get("MEOWVOICE_TRICLAW_RUNTIME", "claude")
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_TRACING_LINE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+.*\s(?:INFO|WARN|ERROR|DEBUG|TRACE)\s")
+_ROUTED_RE = re.compile(r"^routed to \w+.*confidence \d", re.IGNORECASE)
+
+
 def _strip_ansi_and_log_lines(text: str) -> str:
     """Remove ANSI escape codes and tracing log lines from triclaw output."""
-    import re as _re
-    ansi_re = _re.compile(r"\x1b\[[0-9;]*m")
-    cleaned = ansi_re.sub("", text)
+    cleaned = _ANSI_RE.sub("", text)
     lines = [
         line for line in cleaned.splitlines()
-        if not (line.strip().startswith("2") and " INFO " in line)
-        and not (line.strip().startswith("2") and " WARN " in line)
-        and not (line.strip().startswith("2") and " ERROR " in line)
-        and "routed to" not in line.lower()
+        if not _TRACING_LINE_RE.match(line.strip())
+        and not _ROUTED_RE.match(line.strip())
     ]
     return "\n".join(lines).strip()
 
@@ -430,7 +441,16 @@ def _strip_ansi_and_log_lines(text: str) -> str:
 async def _triclaw_dispatch(text: str) -> str | None:
     """Dispatch voice text via TriClaw runtime (model routing + failover + EventStore)."""
     prompt = f"{VOICE_SYSTEM_PROMPT}\n\n使用者說：{text}"
-    env = {**os.environ, "RUST_LOG": "error"}
+    _DISPATCH_ENV_ALLOW = [
+        "PATH", "HOME", "USER", "SHELL", "LANG", "TERM",
+        "TRICLAW_HOME", "ANTHROPIC_API_KEY",
+        "CLAUDE_CODE_EXECPATH", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+    ]
+    env = {"RUST_LOG": "error"}
+    for k in _DISPATCH_ENV_ALLOW:
+        v = os.environ.get(k, "")
+        if v:
+            env[k] = v
     proc = await asyncio.create_subprocess_exec(
         TRICLAW_BINARY, "runtime", "dispatch", prompt,
         "--runtime", TRICLAW_RUNTIME,
@@ -477,7 +497,7 @@ async def _do_dispatch(req: VoiceDispatchRequest) -> dict:
 
     # Audit trail: post to Discord (fire-and-forget)
     if DISCORD_WEBHOOK:
-        asyncio.get_event_loop().run_in_executor(None, _discord_post_webhook, display_text)
+        asyncio.get_running_loop().run_in_executor(None, _discord_post_webhook, display_text)
 
     logger.info("Voice dispatch: text=%r context=%s", cleaned[:40], target_channel)
     t_start = time.time()
@@ -491,7 +511,7 @@ async def _do_dispatch(req: VoiceDispatchRequest) -> dict:
 
     # Audit trail: post response to Discord
     if DISCORD_WEBHOOK:
-        asyncio.get_event_loop().run_in_executor(
+        asyncio.get_running_loop().run_in_executor(
             None, _discord_post_webhook, f"🫧 {reply_text}", "青喵 (語音回覆)"
         )
 
@@ -499,23 +519,18 @@ async def _do_dispatch(req: VoiceDispatchRequest) -> dict:
     return {"text": reply_text, "timeout": False, "elapsed": elapsed}
 
 
+ALLOWED_CACHE_KEYS = frozenset(CACHED_PHRASES.keys())
+
+
 @app.get("/voice/cached/{key}")
 async def cached_voice(key: str):
     """Serve pre-cached voice feedback (ack/heartbeat/timeout)."""
+    if key not in ALLOWED_CACHE_KEYS:
+        return JSONResponse({"error": "Invalid cache key"}, status_code=400)
     data = _voice_cache.get(key)
     if not data:
-        return JSONResponse({"error": f"No cached voice: {key}"}, status_code=404)
+        return JSONResponse({"error": "Voice not yet cached"}, status_code=503)
     return StreamingResponse(io.BytesIO(data), media_type="audio/wav")
-
-
-def _split_sentences(text: str) -> list[str]:
-    """Split text into sentences for progressive TTS."""
-    import re as _re
-    parts = _re.split(r"(?<=[。！？!?\n])", text)
-    sentences = [s.strip() for s in parts if s.strip()]
-    if not sentences and text.strip():
-        sentences = [text.strip()]
-    return sentences
 
 
 @app.get("/test", response_class=HTMLResponse)

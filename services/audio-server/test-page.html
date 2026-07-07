@@ -98,8 +98,13 @@
 </div>
 
 <audio id="ttsAudio"></audio>
+<audio id="feedbackAudio"></audio>
 
 <script>
+const HEARTBEAT_MS = 15000;
+const TIMEOUT_WARNING_MS = 60000;
+const ABORT_MS = 180000;
+
 const $ = id => document.getElementById(id);
 const dot = $('dot');
 const statusText = $('statusText');
@@ -109,6 +114,7 @@ const phaseDetail = $('phaseDetail');
 const timerEl = $('timer');
 const chatEl = $('chat');
 const ttsAudio = $('ttsAudio');
+const feedbackAudio = $('feedbackAudio');
 
 let mediaRecorder = null;
 let chunks = [];
@@ -151,24 +157,38 @@ function stopTimer() {
 }
 
 async function playAudioUrl(url) {
-  const res = await fetch(url);
-  const blob = await res.blob();
-  const objUrl = URL.createObjectURL(blob);
+  var res = await fetch(url);
+  var blob = await res.blob();
+  var objUrl = URL.createObjectURL(blob);
   ttsAudio.src = objUrl;
   await ttsAudio.play();
-  await new Promise(resolve => { ttsAudio.onended = resolve; });
+  await new Promise(function(resolve) { ttsAudio.onended = resolve; });
   URL.revokeObjectURL(objUrl);
 }
 
+function playFeedback(url) {
+  feedbackAudio.src = url;
+  feedbackAudio.play().catch(function() {});
+}
+
+function stopFeedback() {
+  feedbackAudio.pause();
+  feedbackAudio.src = '';
+}
+
 function splitSentences(text) {
-  var parts = text.split(/(?<=[。！？!?\n])/);
-  var sentences = [];
-  for (var i = 0; i < parts.length; i++) {
-    var s = parts[i].trim();
-    if (s) sentences.push(s);
+  var result = [];
+  var current = '';
+  for (var i = 0; i < text.length; i++) {
+    current += text[i];
+    if ('。！？!?\n'.indexOf(text[i]) >= 0) {
+      if (current.trim()) result.push(current.trim());
+      current = '';
+    }
   }
-  if (sentences.length === 0 && text.trim()) sentences.push(text.trim());
-  return sentences;
+  if (current.trim()) result.push(current.trim());
+  if (result.length === 0 && text.trim()) result.push(text.trim());
+  return result;
 }
 
 async function checkHealth() {
@@ -250,19 +270,21 @@ async function processVoice(audioBlob) {
   var ext = audioBlob.type.includes('mp4') ? 'mp4' : audioBlob.type.includes('webm') ? 'webm' : 'wav';
 
   if (typeof AudioContext !== 'undefined') {
+    var audioCtx = null;
     try {
       setPhase('轉換音訊…', '');
       var arrayBuf = await audioBlob.arrayBuffer();
-      var audioCtx = new AudioContext();
+      audioCtx = new AudioContext();
       var decoded = await audioCtx.decodeAudioData(arrayBuf);
       var pcm = decoded.getChannelData(0);
       var wavBuf = encodeWAV(pcm, decoded.sampleRate);
       wavBlob = new Blob([wavBuf], { type: 'audio/wav' });
       ext = 'wav';
-      audioCtx.close();
     } catch (e) {
       console.warn('Client-side WAV conversion failed, sending raw audio:', e);
       wavBlob = audioBlob;
+    } finally {
+      if (audioCtx) audioCtx.close();
     }
   }
 
@@ -286,32 +308,24 @@ async function processVoice(audioBlob) {
   setPhase('青喵處理中…', '');
   startTimer();
 
-  // Play cached "ack" immediately while dispatch runs
-  var ackPlayed = false;
-  var heartbeatTimer = null;
-  var timeoutTimer = null;
+  // Feedback uses separate audio channel — no racing with TTS
+  playFeedback(getServer() + '/voice/cached/ack');
 
-  var ackPromise = playAudioUrl(getServer() + '/voice/cached/ack').then(function() {
-    ackPlayed = true;
-  }).catch(function() {});
-
-  // Heartbeat at 15s
-  heartbeatTimer = setTimeout(function() {
+  var heartbeatTimer = setTimeout(function() {
     setPhase('青喵處理中…', '查詢資料中');
-    playAudioUrl(getServer() + '/voice/cached/heartbeat').catch(function() {});
-  }, 15000);
+    playFeedback(getServer() + '/voice/cached/heartbeat');
+  }, HEARTBEAT_MS);
 
-  // Timeout warning at 60s
-  timeoutTimer = setTimeout(function() {
+  var timeoutTimer = setTimeout(function() {
     setPhase('青喵處理中…', '背景處理');
-    playAudioUrl(getServer() + '/voice/cached/timeout').catch(function() {});
-  }, 60000);
+    playFeedback(getServer() + '/voice/cached/timeout');
+  }, TIMEOUT_WARNING_MS);
 
-  const t0 = Date.now();
+  var t0 = Date.now();
   var dispatchData;
   try {
     var ctrl = new AbortController();
-    var tid = setTimeout(function() { ctrl.abort(); }, 180000);
+    var tid = setTimeout(function() { ctrl.abort(); }, ABORT_MS);
     var dispatchRes = await fetch(getServer() + '/voice/dispatch', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -323,12 +337,14 @@ async function processVoice(audioBlob) {
   } catch (fetchErr) {
     clearTimeout(heartbeatTimer);
     clearTimeout(timeoutTimer);
+    stopFeedback();
     addMsg('system', '連線中斷，請重試（' + fetchErr.message + '）');
     return;
   }
   clearTimeout(heartbeatTimer);
   clearTimeout(timeoutTimer);
-  const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+  stopFeedback();
+  var elapsed = ((Date.now() - t0) / 1000).toFixed(1);
   stopTimer();
 
   if (dispatchData.timeout || !dispatchData.text) {
