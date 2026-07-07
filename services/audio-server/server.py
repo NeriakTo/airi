@@ -142,6 +142,38 @@ def build_stt_prompt(channel_id: str = "") -> str:
     return "".join(parts)
 
 
+GATEWAY_CONFIG_PATH = Path(os.environ.get(
+    "MEOWVOICE_GATEWAY_CONFIG",
+    str(Path.home() / ".meowvoice" / "gateway.json"),
+))
+_gateway_config: dict = {}
+
+
+def _load_gateway_config() -> dict:
+    global _gateway_config, CHANNEL_ROUTES, CHANNEL_TERMS, STT_GLOBAL_TERMS, VOICE_CHANNEL_ID
+    if not GATEWAY_CONFIG_PATH.exists():
+        logger.warning("Gateway config not found: %s, using defaults", GATEWAY_CONFIG_PATH)
+        return {}
+    with open(GATEWAY_CONFIG_PATH) as f:
+        config = json.load(f)
+    _gateway_config = config
+    routing = config.get("channel_routing", {})
+    if routing.get("routes"):
+        CHANNEL_ROUTES = [(r["prefixes"], r["channel_id"]) for r in routing["routes"]]
+    if routing.get("terminology"):
+        CHANNEL_TERMS = routing["terminology"]
+    if routing.get("global_terms"):
+        STT_GLOBAL_TERMS = routing["global_terms"]
+    if routing.get("default_channel_id"):
+        VOICE_CHANNEL_ID = routing["default_channel_id"]
+    rt_count = sum(1 for r in config.get("runtimes", {}).values() if r.get("enabled"))
+    logger.info("Gateway config loaded: %d runtimes, %d routes", rt_count, len(CHANNEL_ROUTES))
+    return config
+
+
+_load_gateway_config()
+
+
 tts_model = None
 stt_model_id = None
 _tts_lock = asyncio.Lock()
@@ -399,7 +431,7 @@ async def chat_completions(request: Request, req: ChatCompletionRequest):
         return JSONResponse({"error": "No user message"}, status_code=400)
 
     prompt_text = user_messages[-1]
-    result = await _inject_to_plugin(prompt_text)
+    result = await _dispatch_to_runtime(prompt_text)
 
     if "error" in result:
         return JSONResponse(
@@ -453,6 +485,7 @@ async def _discord_post_webhook(text: str, username: str = "Kevin (語音)") -> 
 class VoiceDispatchRequest(BaseModel):
     text: str
     channel_hint: str = ""
+    runtime: str | None = None
 
 
 def _check_pin(request) -> bool:
@@ -462,8 +495,43 @@ def _check_pin(request) -> bool:
     return hmac.compare_digest(request.headers.get("x-voice-pin", ""), VOICE_PIN)
 
 
-async def _inject_to_plugin(text: str) -> dict:
-    """POST STT text to the voice channel plugin for injection into Claude Code session."""
+async def _dispatch_to_runtime(text: str, runtime_id: str | None = None) -> dict:
+    """Dispatch voice text to the specified (or default) runtime adapter."""
+    if not _http_client:
+        return {"error": "HTTP client not initialized"}
+    runtimes = _gateway_config.get("runtimes", {})
+    if not runtimes:
+        return await _inject_legacy(text)
+    if runtime_id:
+        runtime = runtimes.get(runtime_id)
+        if not runtime:
+            return {"error": f"Unknown runtime: {runtime_id}"}
+        if not runtime.get("enabled"):
+            return {"error": f"Runtime disabled: {runtime_id}"}
+    else:
+        runtime_id, runtime = next(
+            ((rid, r) for rid, r in runtimes.items() if r.get("default") and r.get("enabled")),
+            (None, None),
+        )
+        if not runtime:
+            return await _inject_legacy(text)
+    callback_url = _gateway_config.get("callback_url", f"http://127.0.0.1:{PORT}/voice/reply-callback")
+    try:
+        resp = await _http_client.post(
+            runtime["url"],
+            json={"text": text, "callback_url": callback_url, "user": "Kevin"},
+            headers={"X-Voice-Pin": VOICE_PIN},
+        )
+        result = resp.json()
+        result["runtime"] = runtime_id
+        return result
+    except Exception as e:
+        logger.error("Runtime dispatch failed [%s]: %s", runtime_id, e)
+        return {"error": str(e)}
+
+
+async def _inject_legacy(text: str) -> dict:
+    """Fallback: direct injection to MCP plugin when no gateway config."""
     if not _http_client:
         return {"error": "HTTP client not initialized"}
     try:
@@ -498,7 +566,7 @@ async def voice_dispatch(request: Request, req: VoiceDispatchRequest):
     logger.info("Voice inject: text=%r", cleaned[:60])
     t_start = time.time()
 
-    result = await _inject_to_plugin(cleaned)
+    result = await _dispatch_to_runtime(cleaned, req.runtime)
     elapsed = time.time() - t_start
 
     if "error" in result:
@@ -513,22 +581,41 @@ async def voice_dispatch(request: Request, req: VoiceDispatchRequest):
 class VoiceReplyCallback(BaseModel):
     text: str
     message_id: str = ""
+    runtime_id: str = ""
 
 
 @app.post("/voice/reply-callback")
 async def voice_reply_callback(request: Request, req: VoiceReplyCallback):
-    """Receive Claude's voice reply from the voice channel plugin, trigger TTS."""
+    """Receive reply from any runtime adapter, log and optionally trigger TTS."""
     if not _check_pin(request):
         return JSONResponse({"error": "Invalid PIN"}, status_code=401)
     if not req.text.strip():
         return JSONResponse({"error": "Empty reply"}, status_code=400)
 
-    logger.info("Voice reply received: text=%r", req.text[:60])
+    source = req.runtime_id or "claude-code"
+    logger.info("Voice reply [%s]: text=%r", source, req.text[:60])
 
     if DISCORD_WEBHOOK:
-        asyncio.ensure_future(_discord_post_webhook(f"🫧 {req.text}", "青喵 (語音回覆)"))
+        asyncio.ensure_future(_discord_post_webhook(f"🫧 {req.text}", f"青喵 (語音回覆/{source})"))
 
-    return {"ok": True, "text_length": len(req.text)}
+    return {"ok": True, "text_length": len(req.text), "runtime": source}
+
+
+@app.get("/voice/runtimes")
+async def list_runtimes(request: Request):
+    """List available runtime adapters and their status."""
+    if not _check_pin(request):
+        return JSONResponse({"error": "Invalid PIN"}, status_code=401)
+    runtimes = _gateway_config.get("runtimes", {})
+    result = {}
+    for rid, r in runtimes.items():
+        result[rid] = {
+            "type": r.get("type", "unknown"),
+            "enabled": r.get("enabled", False),
+            "default": r.get("default", False),
+            "description": r.get("description", ""),
+        }
+    return {"runtimes": result}
 
 
 ALLOWED_CACHE_KEYS = frozenset(CACHED_PHRASES.keys())
