@@ -78,27 +78,31 @@ def _hash_pin(pin: str, salt: bytes) -> str:
 
 
 def _init_pin_storage() -> None:
+    global VOICE_PIN
     if _PIN_HASH_FILE.exists():
+        VOICE_PIN = ""
         return
     if not VOICE_PIN:
         return
     _MEOWVOICE_DIR.mkdir(parents=True, exist_ok=True)
     salt = secrets.token_bytes(32)
     _PIN_SALT_FILE.write_bytes(salt)
+    os.chmod(str(_PIN_SALT_FILE), 0o600)
     _PIN_HASH_FILE.write_text(_hash_pin(VOICE_PIN, salt))
+    os.chmod(str(_PIN_HASH_FILE), 0o600)
+    VOICE_PIN = ""
     logger.info("PIN hash initialized (PBKDF2-SHA256, 100k rounds)")
 
 
 def _verify_pin(pin: str) -> bool:
     if not pin:
         return False
-    if _PIN_HASH_FILE.exists() and _PIN_SALT_FILE.exists():
-        salt = _PIN_SALT_FILE.read_bytes()
-        expected = _PIN_HASH_FILE.read_text().strip()
-        return hmac.compare_digest(_hash_pin(pin, salt), expected)
-    if not VOICE_PIN:
+    if not _PIN_HASH_FILE.exists() or not _PIN_SALT_FILE.exists():
+        logger.warning("PIN hash files missing — run /voice/pin/setup from localhost")
         return False
-    return hmac.compare_digest(pin, VOICE_PIN)
+    salt = _PIN_SALT_FILE.read_bytes()
+    expected = _PIN_HASH_FILE.read_text().strip()
+    return hmac.compare_digest(_hash_pin(pin, salt), expected)
 
 
 def _check_rate_limit(ip: str) -> bool:
@@ -222,12 +226,20 @@ def _load_gateway_config() -> dict:
     if not GATEWAY_CONFIG_PATH.exists():
         logger.warning("Gateway config not found: %s, using defaults", GATEWAY_CONFIG_PATH)
         return {}
-    with open(GATEWAY_CONFIG_PATH) as f:
-        config = json.load(f)
+    try:
+        with open(GATEWAY_CONFIG_PATH) as f:
+            config = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        logger.error("Gateway config parse failed: %s, using defaults", e)
+        return {}
     _gateway_config = config
     routing = config.get("channel_routing", {})
-    if routing.get("routes"):
-        CHANNEL_ROUTES = [(r["prefixes"], r["channel_id"]) for r in routing["routes"]]
+    try:
+        routes = routing.get("routes", [])
+        if routes:
+            CHANNEL_ROUTES = [(r["prefixes"], r["channel_id"]) for r in routes]
+    except (KeyError, TypeError) as e:
+        logger.error("Gateway routes malformed: %s, keeping defaults", e)
     if routing.get("terminology"):
         CHANNEL_TERMS = routing["terminology"]
     if routing.get("global_terms"):
@@ -643,7 +655,7 @@ async def voice_dispatch(request: Request, req: VoiceDispatchRequest):
         display_text = f"[→ <#{target_channel}>] {cleaned}"
 
     if DISCORD_WEBHOOK:
-        asyncio.ensure_future(_discord_post_webhook(display_text))
+        asyncio.create_task(_discord_post_webhook(display_text))
 
     logger.info("Voice inject: text=%r", cleaned[:60])
     t_start = time.time()
@@ -678,7 +690,7 @@ async def voice_reply_callback(request: Request, req: VoiceReplyCallback):
     logger.info("Voice reply [%s]: text=%r", source, req.text[:60])
 
     if DISCORD_WEBHOOK:
-        asyncio.ensure_future(_discord_post_webhook(f"🫧 {req.text}", f"青喵 (語音回覆/{source})"))
+        asyncio.create_task(_discord_post_webhook(f"🫧 {req.text}", f"青喵 (語音回覆/{source})"))
 
     return {"ok": True, "text_length": len(req.text), "runtime": source}
 
@@ -723,7 +735,9 @@ async def pin_setup(request: Request, req: PinSetupRequest):
         return JSONResponse({"error": "PIN must be exactly 6 digits"}, status_code=400)
     salt = secrets.token_bytes(32)
     _PIN_SALT_FILE.write_bytes(salt)
+    os.chmod(str(_PIN_SALT_FILE), 0o600)
     _PIN_HASH_FILE.write_text(_hash_pin(req.pin, salt))
+    os.chmod(str(_PIN_HASH_FILE), 0o600)
     logger.info("PIN setup completed from %s", client_ip)
     return {"ok": True}
 
