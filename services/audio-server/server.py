@@ -372,25 +372,46 @@ _dispatch_lock = asyncio.Lock()
 VOICE_SYSTEM_PROMPT = """你是青喵（CyanMeow），Kevin 的 AI 主控核心。現在是語音對話模式。
 回覆規則：繁體中文、口語化、2-4 句話以內、先結論再補充、不用 markdown。"""
 
+TRICLAW_BINARY = os.environ.get("MEOWVOICE_TRICLAW_BINARY", "triclaw")
+TRICLAW_RUNTIME = os.environ.get("MEOWVOICE_TRICLAW_RUNTIME", "claude")
 
-async def _claude_cli_process(text: str) -> str | None:
-    """Call claude CLI in one-shot mode to process voice text."""
+
+def _strip_ansi_and_log_lines(text: str) -> str:
+    """Remove ANSI escape codes and tracing log lines from triclaw output."""
+    import re as _re
+    ansi_re = _re.compile(r"\x1b\[[0-9;]*m")
+    cleaned = ansi_re.sub("", text)
+    lines = [
+        line for line in cleaned.splitlines()
+        if not (line.strip().startswith("2") and " INFO " in line)
+        and not (line.strip().startswith("2") and " WARN " in line)
+        and not (line.strip().startswith("2") and " ERROR " in line)
+        and "routed to" not in line.lower()
+    ]
+    return "\n".join(lines).strip()
+
+
+async def _triclaw_dispatch(text: str) -> str | None:
+    """Dispatch voice text via TriClaw runtime (model routing + failover + EventStore)."""
     prompt = f"{VOICE_SYSTEM_PROMPT}\n\n使用者說：{text}"
+    env = {**os.environ, "RUST_LOG": "error"}
     proc = await asyncio.create_subprocess_exec(
-        "claude", "-p", "--max-turns", "3", "--output-format", "text",
-        stdin=asyncio.subprocess.PIPE,
+        TRICLAW_BINARY, "runtime", "dispatch", prompt,
+        "--runtime", TRICLAW_RUNTIME,
+        "--timeout", str(DISPATCH_TIMEOUT),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=env,
     )
     try:
         stdout, stderr = await asyncio.wait_for(
-            proc.communicate(input=prompt.encode()),
-            timeout=DISPATCH_TIMEOUT,
+            proc.communicate(),
+            timeout=DISPATCH_TIMEOUT + 10,
         )
         if proc.returncode == 0 and stdout:
-            return stdout.decode().strip()
+            return _strip_ansi_and_log_lines(stdout.decode())
         logger.error(
-            "claude CLI failed: rc=%s stdout=%s stderr=%s",
+            "triclaw dispatch failed: rc=%s stdout=%s stderr=%s",
             proc.returncode,
             stdout.decode()[:200] if stdout else "(empty)",
             stderr.decode()[:200] if stderr else "(empty)",
@@ -398,13 +419,13 @@ async def _claude_cli_process(text: str) -> str | None:
         return None
     except asyncio.TimeoutError:
         proc.kill()
-        logger.error("claude CLI timeout after %ds", DISPATCH_TIMEOUT)
+        logger.error("triclaw dispatch timeout after %ds", DISPATCH_TIMEOUT + 10)
         return None
 
 
 @app.post("/voice/dispatch")
 async def voice_dispatch(req: VoiceDispatchRequest):
-    """Process voice text via claude CLI and return response."""
+    """Process voice text via TriClaw runtime dispatch."""
     async with _dispatch_lock:
         return await _do_dispatch(req)
 
@@ -425,7 +446,7 @@ async def _do_dispatch(req: VoiceDispatchRequest) -> dict:
     logger.info("Voice dispatch: text=%r context=%s", cleaned[:40], target_channel)
     t_start = time.time()
 
-    reply_text = await _claude_cli_process(cleaned)
+    reply_text = await _triclaw_dispatch(cleaned)
 
     elapsed = time.time() - t_start
     if not reply_text:
