@@ -6,7 +6,6 @@ Voice Bridge: 語音文字 → TriClaw runtime dispatch → TTS
 
 import io
 import os
-import re
 import json
 import time
 import wave
@@ -21,7 +20,7 @@ from pathlib import Path
 
 import numpy as np
 import uvicorn
-from fastapi import FastAPI, UploadFile, File, Query
+from fastapi import FastAPI, Request, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 
@@ -56,7 +55,9 @@ PORT = int(os.environ.get("MEOWVOICE_PORT", "8400"))
 DISCORD_WEBHOOK = os.environ.get("MEOWVOICE_DISCORD_WEBHOOK", "")
 VOICE_CHANNEL_ID = os.environ.get("MEOWVOICE_VOICE_CHANNEL_ID", "1475645959542145166")
 CYANMEOW_BOT_ID = os.environ.get("MEOWVOICE_CYANMEOW_BOT_ID", "1490193787463532724")
-DISPATCH_TIMEOUT = int(os.environ.get("MEOWVOICE_DISPATCH_TIMEOUT", "120"))
+DISPATCH_TIMEOUT = int(os.environ.get("MEOWVOICE_DISPATCH_TIMEOUT", "60"))
+VOICE_PIN = os.environ.get("MEOWVOICE_PIN", "")
+VOICE_PLUGIN_URL = os.environ.get("MEOWVOICE_VOICE_PLUGIN", "http://127.0.0.1:8401")
 
 def _load_discord_bot_token() -> str:
     token = os.environ.get("MEOWVOICE_DISCORD_BOT_TOKEN", "")
@@ -103,10 +104,14 @@ CHANNEL_ROUTES: list[tuple[list[str], str]] = [
 ]
 
 STT_BASE_PROMPT = "以下是繁體中文與英文混雜語音的轉錄。"
-STT_GLOBAL_TERMS = "青喵、黑喵、貓爪、灰喵、小野、TriClaw、MeowVoice、Kevin"
+STT_GLOBAL_TERMS = (
+    "青喵、黑喵、貓爪、灰喵、小野、TriClaw、MeowVoice、Kevin、"
+    "Claude Code、Codex、Hermes、Anthropic、Discord、Tauri、Live2D、"
+    "Breeze、Qwen、MLX、Electron"
+)
 
 CHANNEL_TERMS: dict[str, str] = {
-    "1486183810143097093": "TriClaw、EventStore、correlation ID、SSE、Kernel、Runtime、Skill",
+    "1486183810143097093": "TriClaw、EventStore、correlation ID、SSE、Kernel、Runtime、Skill、dispatch、daemon",
     "1480803774116266110": "連線科技、MES、Galaxy、webhook、schema、Drizzle、BOM、HURCO、Dictionary、Pipeline",
     "1489111296103288952": "全有織造、forecast、MCO、品號、MES",
     "1511980894246801538": "印比雅、鉅茂、ITEC、BI、POC",
@@ -210,7 +215,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="MeowVoice Audio Server", lifespan=lifespan)
 ALLOWED_ORIGINS = os.environ.get(
     "MEOWVOICE_CORS_ORIGINS",
-    "http://localhost:5173,http://127.0.0.1:5173,https://127.0.0.1:8400",
+    "http://localhost:5173,http://localhost:5174,http://127.0.0.1:5173,https://127.0.0.1:8400,https://meowvoice.nerigate.dev,https://airi.nerigate.dev",
 ).split(",")
 app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_methods=["*"], allow_headers=["*"])
 
@@ -286,11 +291,14 @@ async def _tts_generate_inner(req: TtsRequest):
 
 @app.post("/stt")
 async def stt_transcribe(
+    request: Request,
     file: UploadFile = File(..., description="WAV audio file"),
     lang: str = Query(default="zh", description="Language hint"),
     channel_id: str = Query(default="", description="Channel ID for terminology prompt"),
 ):
     """Transcribe audio to text using mlx-whisper with dynamic terminology."""
+    if not _check_pin(request):
+        return JSONResponse({"error": "Invalid PIN"}, status_code=401)
     import mlx_whisper  # noqa: E402 — lazy import to avoid load at startup
 
     t_start = time.time()
@@ -353,13 +361,18 @@ async def openai_speech(req: OpenAISpeechRequest):
 
 @app.post("/v1/audio/transcriptions")
 async def openai_transcriptions(
+    request: Request,
     file: UploadFile = File(...),
     model: str = Query(default="breeze-asr-25"),
     language: str = Query(default="zh"),
     channel_id: str = Query(default="", alias="channel_id"),
 ):
     """OpenAI-compatible STT endpoint with dynamic terminology."""
-    result = await stt_transcribe(file=file, lang=language, channel_id=channel_id)
+    if not _check_pin(request):
+        return JSONResponse({"error": "Invalid PIN"}, status_code=401)
+    result = await stt_transcribe(request=request, file=file, lang=language, channel_id=channel_id)
+    if isinstance(result, JSONResponse):
+        return result
     return {"text": result["text"]}
 
 
@@ -373,19 +386,21 @@ class ChatCompletionRequest(BaseModel):
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest):
-    """OpenAI-compatible chat endpoint backed by TriClaw dispatch."""
+    """OpenAI-compatible chat endpoint — injects into Claude Code session via voice plugin."""
     user_messages = [m["content"] for m in req.messages if m.get("role") == "user"]
     if not user_messages:
         return JSONResponse({"error": "No user message"}, status_code=400)
 
     prompt_text = user_messages[-1]
-    reply = await _triclaw_dispatch(prompt_text)
+    result = await _inject_to_plugin(prompt_text)
 
-    if not reply:
+    if "error" in result:
         return JSONResponse(
-            {"error": {"message": "TriClaw dispatch failed", "type": "server_error"}},
+            {"error": {"message": f"Voice inject failed: {result['error']}", "type": "server_error"}},
             status_code=502,
         )
+
+    reply = f"[Injected into Claude Code session: {result.get('message_id', '')}]"
 
     return {
         "id": f"chatcmpl-{int(time.time())}",
@@ -451,80 +466,48 @@ class VoiceDispatchRequest(BaseModel):
     channel_hint: str = ""
 
 
-_dispatch_lock = asyncio.Lock()
-
-VOICE_SYSTEM_PROMPT = """你是青喵（CyanMeow），Kevin 的 AI 主控核心。現在是語音對話模式。
-回覆規則：繁體中文、口語化、2-4 句話以內、先結論再補充、不用 markdown。"""
-
-TRICLAW_BINARY = os.environ.get("MEOWVOICE_TRICLAW_BINARY", "triclaw")
-TRICLAW_RUNTIME = os.environ.get("MEOWVOICE_TRICLAW_RUNTIME", "claude")
+def _check_pin(request) -> bool:
+    """Validate 6-digit PIN from X-Voice-Pin header."""
+    if not VOICE_PIN:
+        return True
+    return request.headers.get("x-voice-pin", "") == VOICE_PIN
 
 
-_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-_TRACING_LINE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+.*\s(?:INFO|WARN|ERROR|DEBUG|TRACE)\s")
-_ROUTED_RE = re.compile(r"^routed to \w+.*confidence \d", re.IGNORECASE)
+_pending_replies: dict[str, asyncio.Future] = {}
 
 
-def _strip_ansi_and_log_lines(text: str) -> str:
-    """Remove ANSI escape codes and tracing log lines from triclaw output."""
-    cleaned = _ANSI_RE.sub("", text)
-    lines = [
-        line for line in cleaned.splitlines()
-        if not _TRACING_LINE_RE.match(line.strip())
-        and not _ROUTED_RE.match(line.strip())
-    ]
-    return "\n".join(lines).strip()
-
-
-async def _triclaw_dispatch(text: str) -> str | None:
-    """Dispatch voice text via TriClaw runtime (model routing + failover + EventStore)."""
-    prompt = f"{VOICE_SYSTEM_PROMPT}\n\n使用者說：{text}"
-    _DISPATCH_ENV_ALLOW = [
-        "PATH", "HOME", "USER", "SHELL", "LANG", "TERM",
-        "TRICLAW_HOME", "ANTHROPIC_API_KEY",
-        "CLAUDE_CODE_EXECPATH", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
-    ]
-    env = {"RUST_LOG": "error"}
-    for k in _DISPATCH_ENV_ALLOW:
-        v = os.environ.get(k, "")
-        if v:
-            env[k] = v
-    proc = await asyncio.create_subprocess_exec(
-        TRICLAW_BINARY, "runtime", "dispatch", prompt,
-        "--runtime", TRICLAW_RUNTIME,
-        "--timeout", str(DISPATCH_TIMEOUT),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=env,
+async def _inject_to_plugin(text: str) -> dict:
+    """POST STT text to the voice channel plugin for injection into Claude Code session."""
+    body = json.dumps({"text": text}).encode()
+    headers = {
+        "Content-Type": "application/json",
+        "X-Voice-Pin": VOICE_PIN,
+    }
+    req = urllib.request.Request(
+        f"{VOICE_PLUGIN_URL}/inject",
+        data=body, headers=headers,
     )
     try:
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(),
-            timeout=DISPATCH_TIMEOUT + 10,
+        loop = asyncio.get_running_loop()
+        resp_data: bytes = await asyncio.wait_for(
+            loop.run_in_executor(
+                None,
+                lambda: urllib.request.urlopen(req, timeout=10).read(),
+            ),
+            timeout=15,
         )
-        if proc.returncode == 0 and stdout:
-            return _strip_ansi_and_log_lines(stdout.decode())
-        logger.error(
-            "triclaw dispatch failed: rc=%s stdout=%s stderr=%s",
-            proc.returncode,
-            stdout.decode()[:200] if stdout else "(empty)",
-            stderr.decode()[:200] if stderr else "(empty)",
-        )
-        return None
-    except asyncio.TimeoutError:
-        proc.kill()
-        logger.error("triclaw dispatch timeout after %ds", DISPATCH_TIMEOUT + 10)
-        return None
+        return json.loads(resp_data)
+    except Exception as e:
+        logger.error("Voice plugin inject failed: %s", e)
+        return {"error": str(e)}
 
 
 @app.post("/voice/dispatch")
-async def voice_dispatch(req: VoiceDispatchRequest):
-    """Process voice text via TriClaw runtime dispatch."""
-    async with _dispatch_lock:
-        return await _do_dispatch(req)
+async def voice_dispatch(request: Request, req: VoiceDispatchRequest):
+    """Inject voice text into Claude Code session via voice channel plugin."""
+    if not _check_pin(request):
+        return JSONResponse({"error": "Invalid PIN"}, status_code=401)
 
-
-async def _do_dispatch(req: VoiceDispatchRequest) -> dict:
     target_channel, cleaned = _route_prefix(req.text)
     if req.channel_hint:
         target_channel = req.channel_hint
@@ -533,28 +516,48 @@ async def _do_dispatch(req: VoiceDispatchRequest) -> dict:
     if target_channel != VOICE_CHANNEL_ID:
         display_text = f"[→ <#{target_channel}>] {cleaned}"
 
-    # Audit trail: post to Discord (fire-and-forget)
     if DISCORD_WEBHOOK:
         asyncio.get_running_loop().run_in_executor(None, _discord_post_webhook, display_text)
 
-    logger.info("Voice dispatch: text=%r context=%s", cleaned[:40], target_channel)
+    logger.info("Voice inject: text=%r", cleaned[:60])
     t_start = time.time()
 
-    reply_text = await _triclaw_dispatch(cleaned)
-
+    result = await _inject_to_plugin(cleaned)
     elapsed = time.time() - t_start
-    if not reply_text:
-        logger.warning("Voice dispatch failed after %.1fs", elapsed)
-        return JSONResponse({"text": "", "timeout": True, "elapsed": elapsed})
 
-    # Audit trail: post response to Discord
+    if "error" in result:
+        logger.warning("Voice inject failed after %.1fs: %s", elapsed, result["error"])
+        return JSONResponse({"injected": False, "error": result["error"], "elapsed": elapsed})
+
+    message_id = result.get("message_id", "")
+    logger.info("Voice injected: message_id=%s elapsed=%.1fs", message_id, elapsed)
+    return {"injected": True, "message_id": message_id, "elapsed": elapsed}
+
+
+class VoiceReplyCallback(BaseModel):
+    text: str
+    message_id: str = ""
+
+
+@app.post("/voice/reply-callback")
+async def voice_reply_callback(req: VoiceReplyCallback):
+    """Receive Claude's voice reply from the voice channel plugin, trigger TTS."""
+    if not req.text.strip():
+        return JSONResponse({"error": "Empty reply"}, status_code=400)
+
+    logger.info("Voice reply received: text=%r", req.text[:60])
+
     if DISCORD_WEBHOOK:
         asyncio.get_running_loop().run_in_executor(
-            None, _discord_post_webhook, f"🫧 {reply_text}", "青喵 (語音回覆)"
+            None, _discord_post_webhook, f"🫧 {req.text}", "青喵 (語音回覆)"
         )
 
-    logger.info("Voice reply: text=%r elapsed=%.1fs", reply_text[:50], elapsed)
-    return {"text": reply_text, "timeout": False, "elapsed": elapsed}
+    if req.message_id and req.message_id in _pending_replies:
+        fut = _pending_replies.pop(req.message_id)
+        if not fut.done():
+            fut.set_result(req.text)
+
+    return {"ok": True, "text_length": len(req.text)}
 
 
 ALLOWED_CACHE_KEYS = frozenset(CACHED_PHRASES.keys())

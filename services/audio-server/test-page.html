@@ -43,6 +43,7 @@
   .mic.hold svg { fill: var(--red); }
   .mic.busy { border-color: var(--cyan); opacity: 0.5; pointer-events: none; }
   .mic.busy svg { fill: var(--cyan); }
+  .mic.locked { border-color: var(--muted); opacity: 0.3; pointer-events: none; }
 
   @keyframes ripple { 0% { box-shadow: 0 0 0 0 rgba(217,72,72,0.3); } 100% { box-shadow: 0 0 0 20px rgba(217,72,72,0); } }
   .mic.hold { animation: ripple 1s ease-out infinite; }
@@ -50,7 +51,27 @@
   .hint { font-size: 0.7rem; color: var(--muted); }
 
   audio { display: none; }
+
+  .pin-overlay { position: fixed; inset: 0; background: var(--bg); display: flex; align-items: center; justify-content: center; z-index: 100; }
+  .pin-box { text-align: center; }
+  .pin-box h2 { font-size: 1.1rem; margin-bottom: 1rem; }
+  .pin-box input { font-family: var(--font); font-size: 1.5rem; width: 180px; text-align: center;
+    padding: 0.6rem; border: 2px solid var(--border); border-radius: 8px;
+    background: var(--surface); color: var(--text); letter-spacing: 0.3em;
+    -webkit-user-select: text; user-select: text; }
+  .pin-box input:focus { outline: none; border-color: var(--cyan); }
+  .pin-box .pin-err { color: var(--red); font-size: 0.8rem; margin-top: 0.5rem; min-height: 1.2rem; }
+  .pin-box .pin-hint { color: var(--muted); font-size: 0.7rem; margin-top: 0.3rem; }
 </style>
+
+<div class="pin-overlay" id="pinOverlay">
+  <div class="pin-box">
+    <h2>MeowVoice</h2>
+    <input type="tel" id="pinInput" maxlength="6" placeholder="PIN" inputmode="numeric" pattern="[0-9]*" autocomplete="off">
+    <div class="pin-err" id="pinErr"></div>
+    <div class="pin-hint">6 碼數字驗證</div>
+  </div>
+</div>
 
 <div class="top-bar">
   <span class="dot" id="dot"></span>
@@ -62,10 +83,10 @@
 
 <div class="mic-area">
   <div class="phase" id="phase"></div>
-  <div class="mic" id="mic">
+  <div class="mic locked" id="mic">
     <svg viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm-1-9c0-.55.45-1 1-1s1 .45 1 1v6c0 .55-.45 1-1 1s-1-.45-1-1V5z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>
   </div>
-  <div class="hint" id="hint">按住說話</div>
+  <div class="hint" id="hint">輸入 PIN 以啟用</div>
 </div>
 
 <audio id="ttsEl"></audio>
@@ -73,6 +94,7 @@
 
 <script>
 var server = window.location.origin;
+var pin = sessionStorage.getItem('meowvoice_pin') || '';
 var dot = document.getElementById('dot');
 var sub = document.getElementById('sub');
 var chat = document.getElementById('chat');
@@ -81,9 +103,16 @@ var mic = document.getElementById('mic');
 var hint = document.getElementById('hint');
 var ttsEl = document.getElementById('ttsEl');
 var fbEl = document.getElementById('fbEl');
+var pinOverlay = document.getElementById('pinOverlay');
+var pinInput = document.getElementById('pinInput');
+var pinErr = document.getElementById('pinErr');
 var busy = false;
 var recorder = null;
 var chunks = [];
+
+function pinHeaders() {
+  return { 'X-Voice-Pin': pin };
+}
 
 function msg(role, text, meta) {
   var d = document.createElement('div');
@@ -116,33 +145,58 @@ function encodeWAV(samples, sr) {
 function playFeedback(key) { fbEl.src = server + '/voice/cached/' + key; fbEl.play().catch(function(){}); }
 function stopFeedback() { fbEl.pause(); fbEl.src = ''; }
 
-function splitSentences(text) {
-  var r = [], c = '';
-  for (var i = 0; i < text.length; i++) {
-    c += text[i];
-    if ('。！？!?\n'.indexOf(text[i]) >= 0) { if (c.trim()) r.push(c.trim()); c = ''; }
+// --- PIN validation ---
+function checkStoredPin() {
+  if (pin && pin.length === 6) {
+    fetch(server + '/health').then(function(r) { return r.json(); }).then(function() {
+      unlockMic();
+    }).catch(function() {
+      showPinScreen();
+    });
+  } else {
+    showPinScreen();
   }
-  if (c.trim()) r.push(c.trim());
-  if (r.length === 0 && text.trim()) r.push(text.trim());
-  return r;
 }
 
-async function playTts(text) {
-  var res = await fetch(server + '/v1/audio/speech', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ input: text, voice: 'Chelsie', model: 'qwen3-tts' }),
-  });
-  var blob = await res.blob();
-  var url = URL.createObjectURL(blob);
-  ttsEl.src = url;
-  await ttsEl.play();
-  await new Promise(function(r) { ttsEl.onended = r; });
-  URL.revokeObjectURL(url);
+function showPinScreen() {
+  pinOverlay.style.display = 'flex';
+  pinInput.value = '';
+  pinInput.focus();
 }
+
+function unlockMic() {
+  pinOverlay.style.display = 'none';
+  mic.classList.remove('locked');
+  hint.textContent = '按住說話';
+}
+
+pinInput.addEventListener('input', function() {
+  pinErr.textContent = '';
+  if (pinInput.value.length === 6) {
+    pin = pinInput.value;
+    // Validate PIN by calling health with pin header (stt requires pin)
+    var form = new FormData();
+    form.append('file', new Blob([new ArrayBuffer(44)], { type: 'audio/wav' }), 'test.wav');
+    fetch(server + '/stt', { method: 'POST', body: form, headers: pinHeaders() })
+      .then(function(r) {
+        if (r.status === 401) {
+          pinErr.textContent = 'PIN 錯誤';
+          pin = '';
+        } else {
+          sessionStorage.setItem('meowvoice_pin', pin);
+          unlockMic();
+          msg('s', '驗證成功，按住麥克風說話');
+        }
+      }).catch(function() {
+        pinErr.textContent = '連線失敗';
+        pin = '';
+      });
+  }
+});
 
 // --- Press-and-hold recording ---
 function startRec() {
-  if (busy) return;
+  if (busy || !pin) return;
   navigator.mediaDevices.getUserMedia({ audio: true }).then(function(stream) {
     var mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
       ? 'audio/webm;codecs=opus'
@@ -191,39 +245,40 @@ async function process(blob) {
   var form = new FormData();
   form.append('file', wavBlob, 'v.' + ext);
   try {
-    var sttRes = await fetch(server + '/v1/audio/transcriptions?model=breeze-asr-25&language=zh', { method: 'POST', body: form });
+    var sttRes = await fetch(server + '/v1/audio/transcriptions?model=breeze-asr-25&language=zh', {
+      method: 'POST', body: form, headers: pinHeaders(),
+    });
+    if (sttRes.status === 401) { msg('s', 'PIN 驗證失敗'); showPinScreen(); done(); return; }
     var sttData = await sttRes.json();
     if (!sttData.text || !sttData.text.trim()) { msg('s', '沒聽到'); done(); return; }
     msg('u', sttData.text);
   } catch (e) { msg('s', 'STT 失敗'); done(); return; }
 
-  // Dispatch with feedback
-  setPhase('青喵思考中…');
+  // Inject to Claude Code session via voice plugin
+  setPhase('送出指令…');
   playFeedback('ack');
-  var hbTimer = setTimeout(function() { playFeedback('heartbeat'); }, 15000);
-  var toTimer = setTimeout(function() { playFeedback('timeout'); }, 60000);
-  var t0 = Date.now();
 
   try {
     var dRes = await fetch(server + '/voice/dispatch', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, pinHeaders()),
       body: JSON.stringify({ text: sttData.text }),
     });
+    if (dRes.status === 401) { msg('s', 'PIN 驗證失敗'); stopFeedback(); showPinScreen(); done(); return; }
     var dData = await dRes.json();
-    clearTimeout(hbTimer); clearTimeout(toTimer); stopFeedback();
-    var elapsed = ((Date.now() - t0) / 1000).toFixed(1);
 
-    if (dData.timeout || !dData.text) { msg('s', '未在時限內回覆 (' + elapsed + 's)'); done(); return; }
-    msg('b', dData.text, elapsed + 's');
-
-    // Sentence TTS
-    var sentences = splitSentences(dData.text);
-    for (var i = 0; i < sentences.length; i++) {
-      setPhase('播放 ' + (i + 1) + '/' + sentences.length);
-      try { await playTts(sentences[i]); } catch (e) {}
+    if (dData.injected) {
+      msg('s', '已送達青喵 (' + dData.message_id + ')');
+      setPhase('等待青喵回覆…');
+      // TTS reply comes back via reply-callback → played by SSE or polling
+      // For now, show confirmation and wait for next voice command
+      stopFeedback();
+    } else {
+      stopFeedback();
+      msg('s', '送出失敗: ' + (dData.error || '未知錯誤'));
     }
   } catch (e) {
-    clearTimeout(hbTimer); clearTimeout(toTimer); stopFeedback();
+    stopFeedback();
     msg('s', '連線失敗');
   }
   done();
@@ -251,5 +306,6 @@ fetch(server + '/health').then(function(r) { return r.json(); }).then(function(d
   sub.textContent = d.stt_model.split('/').pop();
 }).catch(function() { sub.textContent = '離線'; });
 
-msg('s', '按住麥克風開始對話');
+// Init
+checkStoredPin();
 </script>
