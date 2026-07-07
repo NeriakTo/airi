@@ -6,7 +6,6 @@ Voice Bridge: 語音文字 → Discord webhook → 輪詢 CyanMeow 回覆 → TT
 
 import io
 import os
-import re
 import json
 import time
 import wave
@@ -17,7 +16,6 @@ import urllib.request
 import urllib.error
 from contextlib import asynccontextmanager
 
-import ssl
 from pathlib import Path
 
 import numpy as np
@@ -174,67 +172,37 @@ async def tts_generate(req: TtsRequest):
     text, voice, lang, stream = req.text, req.voice, req.lang, req.stream
     t_start = time.time()
 
-    if stream:
-        def generate_chunks():
-            chunk_idx = 0
-            for result in model.generate(
-                text=text,
-                voice=voice,
-                lang_code=lang,
-                verbose=False,
-                stream=True,
-                streaming_interval=1.0,
-            ):
-                if hasattr(result, "audio"):
-                    audio_np = np.array(result.audio)
-                    audio_int16 = (audio_np * 32767).astype(np.int16)
+    # MLX Metal tensors are bound to the main-thread GPU stream (stream 0).
+    # All generation must run on the event-loop thread — acceptable for single-user local server.
+    audio_chunks: list[np.ndarray] = []
+    chunk_count = 0
+    for result in model.generate(
+        text=text,
+        voice=voice,
+        lang_code=lang,
+        verbose=False,
+        stream=stream,
+        **({"streaming_interval": 1.0} if stream else {}),
+    ):
+        if hasattr(result, "audio"):
+            audio_chunks.append(np.array(result.audio))
+            chunk_count += 1
 
-                    buf = io.BytesIO()
-                    with wave.open(buf, "w") as wf:
-                        wf.setnchannels(1)
-                        wf.setsampwidth(2)
-                        wf.setframerate(model.sample_rate)
-                        wf.writeframes(audio_int16.tobytes())
+    if not audio_chunks:
+        return JSONResponse({"error": "No audio generated"}, status_code=500)
 
-                    chunk_data = buf.getvalue()
-                    header = len(chunk_data).to_bytes(4, "big")
-                    yield header + chunk_data
-                    chunk_idx += 1
+    logger.info("TTS done: text=%r chunks=%d time=%.2fs", text[:30], chunk_count, time.time() - t_start)
 
-            logger.info("TTS done: text=%r chunks=%d time=%.2fs", text[:30], chunk_idx, time.time() - t_start)
-
-        return StreamingResponse(
-            generate_chunks(),
-            media_type="application/octet-stream",
-            headers={"X-Sample-Rate": str(model.sample_rate)},
-        )
-    else:
-        def _generate_full():
-            audio_chunks = []
-            for result in model.generate(
-                text=text, voice=voice, lang_code=lang, verbose=False, stream=False,
-            ):
-                if hasattr(result, "audio"):
-                    audio_chunks.append(np.array(result.audio))
-            if not audio_chunks:
-                return None
-            full_audio = np.concatenate(audio_chunks)
-            audio_int16 = (full_audio * 32767).astype(np.int16)
-            buf = io.BytesIO()
-            with wave.open(buf, "w") as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(model.sample_rate)
-                wf.writeframes(audio_int16.tobytes())
-            buf.seek(0)
-            return buf
-
-        buf = await asyncio.to_thread(_generate_full)
-        if buf is None:
-            return JSONResponse({"error": "No audio generated"}, status_code=500)
-
-        logger.info("TTS done: text=%r time=%.2fs", text[:30], time.time() - t_start)
-        return StreamingResponse(buf, media_type="audio/wav")
+    full_audio = np.concatenate(audio_chunks)
+    audio_int16 = (full_audio * 32767).astype(np.int16)
+    buf = io.BytesIO()
+    with wave.open(buf, "w") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(model.sample_rate)
+        wf.writeframes(audio_int16.tobytes())
+    buf.seek(0)
+    return StreamingResponse(buf, media_type="audio/wav")
 
 
 @app.post("/stt")
@@ -256,19 +224,14 @@ async def stt_transcribe(
         tmp_path = tmp.name
 
     try:
-        import asyncio
-
-        def _transcribe():
-            return mlx_whisper.transcribe(
-                tmp_path,
-                path_or_hf_repo=stt_model_id,
-                language=lang,
-                verbose=False,
-                initial_prompt="以下是繁體中文語音內容的轉錄。青喵、灰喵、黑喵、貓爪、小野是 AI 助手的名字。",
-                condition_on_previous_text=False,
-            )
-
-        result = await asyncio.to_thread(_transcribe)
+        result = mlx_whisper.transcribe(
+            tmp_path,
+            path_or_hf_repo=stt_model_id,
+            language=lang,
+            verbose=False,
+            initial_prompt="以下是繁體中文語音內容的轉錄。青喵、灰喵、黑喵、貓爪、小野是 AI 助手的名字。",
+            condition_on_previous_text=False,
+        )
         text = result.get("text", "").strip()
         duration = time.time() - t_start
         logger.info("STT done: text=%r time=%.2fs", text[:50], duration)
@@ -374,20 +337,26 @@ VOICE_SYSTEM_PROMPT = """你是青喵（CyanMeow），Kevin 的 AI 主控核心�
 
 async def _claude_cli_process(text: str) -> str | None:
     """Call claude CLI in one-shot mode to process voice text."""
+    prompt = f"{VOICE_SYSTEM_PROMPT}\n\n使用者說：{text}"
     proc = await asyncio.create_subprocess_exec(
-        "claude", "-p", "--max-turns", "1",
+        "claude", "-p", "--max-turns", "3", "--output-format", "text",
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
     try:
         stdout, stderr = await asyncio.wait_for(
-            proc.communicate(input=text.encode()),
+            proc.communicate(input=prompt.encode()),
             timeout=DISPATCH_TIMEOUT,
         )
         if proc.returncode == 0 and stdout:
             return stdout.decode().strip()
-        logger.error("claude CLI failed: rc=%s stderr=%s", proc.returncode, stderr.decode()[:200])
+        logger.error(
+            "claude CLI failed: rc=%s stdout=%s stderr=%s",
+            proc.returncode,
+            stdout.decode()[:200] if stdout else "(empty)",
+            stderr.decode()[:200] if stderr else "(empty)",
+        )
         return None
     except asyncio.TimeoutError:
         proc.kill()
