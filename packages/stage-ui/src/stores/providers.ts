@@ -478,7 +478,7 @@ export const useProvidersStore = defineStore('providers', () => {
       nameKey: 'settings.pages.providers.provider.meowvoice-mlx-transcription.title',
       descriptionKey: 'settings.pages.providers.provider.meowvoice-mlx-transcription.description',
       icon: 'i-carbon:text-annotation-toggle',
-      description: 'mlx-whisper large-v3-turbo via local MLX audio server',
+      description: 'Breeze-ASR-25 (MediaTek 台灣華語微調) via local MLX audio server',
       category: 'transcription',
       tasks: ['speech-to-text', 'automatic-speech-recognition', 'asr', 'stt'],
       defaultBaseUrl: 'http://127.0.0.1:8400/v1/',
@@ -495,7 +495,7 @@ export const useProvidersStore = defineStore('providers', () => {
       },
       capabilities: {
         listModels: async () => [
-          { id: 'whisper-large-v3-turbo', name: 'Whisper Large V3 Turbo', provider: 'meowvoice-mlx-transcription', description: 'Local MLX STT', contextLength: 0, deprecated: false },
+          { id: 'breeze-asr-25', name: 'Breeze-ASR-25 (台灣華語)', provider: 'meowvoice-mlx-transcription', description: 'Local MLX STT (MediaTek fine-tune)', contextLength: 0, deprecated: false },
         ],
       },
     }),
