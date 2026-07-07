@@ -331,6 +331,7 @@ async def openai_models():
         "data": [
             {"id": "qwen3-tts", "object": "model", "owned_by": "meowvoice"},
             {"id": "breeze-asr-25", "object": "model", "owned_by": "meowvoice"},
+            {"id": "triclaw-dispatch", "object": "model", "owned_by": "meowvoice"},
         ],
     }
 
@@ -360,6 +361,43 @@ async def openai_transcriptions(
     """OpenAI-compatible STT endpoint with dynamic terminology."""
     result = await stt_transcribe(file=file, lang=language, channel_id=channel_id)
     return {"text": result["text"]}
+
+
+class ChatCompletionRequest(BaseModel):
+    model: str = "triclaw-dispatch"
+    messages: list[dict]
+    temperature: float = 0.7
+    max_tokens: int | None = None
+    stream: bool = False
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(req: ChatCompletionRequest):
+    """OpenAI-compatible chat endpoint backed by TriClaw dispatch."""
+    user_messages = [m["content"] for m in req.messages if m.get("role") == "user"]
+    if not user_messages:
+        return JSONResponse({"error": "No user message"}, status_code=400)
+
+    prompt_text = user_messages[-1]
+    reply = await _triclaw_dispatch(prompt_text)
+
+    if not reply:
+        return JSONResponse(
+            {"error": {"message": "TriClaw dispatch failed", "type": "server_error"}},
+            status_code=502,
+        )
+
+    return {
+        "id": f"chatcmpl-{int(time.time())}",
+        "object": "chat.completion",
+        "model": req.model,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": reply},
+            "finish_reason": "stop",
+        }],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
 
 
 def _route_prefix(text: str) -> tuple[str, str]:

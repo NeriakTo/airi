@@ -499,6 +499,33 @@ export const useProvidersStore = defineStore('providers', () => {
         ],
       },
     }),
+    'meowvoice-triclaw-chat': buildOpenAICompatibleProvider({
+      id: 'meowvoice-triclaw-chat',
+      name: 'MeowVoice TriClaw (Chat)',
+      nameKey: 'settings.pages.providers.provider.meowvoice-triclaw-chat.title',
+      descriptionKey: 'settings.pages.providers.provider.meowvoice-triclaw-chat.description',
+      icon: 'i-carbon:chat',
+      description: 'TriClaw runtime dispatch via local MeowVoice server (no API key needed)',
+      category: 'chat',
+      tasks: ['chat'],
+      defaultBaseUrl: 'http://127.0.0.1:8400/v1/',
+      isAvailableBy: isStageTamagotchi,
+      creator: createOpenAI,
+      validation: [],
+      validators: {
+        chatPingCheckAvailable: false,
+        validateProviderConfig: () => ({
+          errors: [],
+          reason: '',
+          valid: true,
+        }),
+      },
+      capabilities: {
+        listModels: async () => [
+          { id: 'triclaw-dispatch', name: 'TriClaw Dispatch (Claude)', provider: 'meowvoice-triclaw-chat', description: 'Local TriClaw runtime dispatch', contextLength: 128000, deprecated: false },
+        ],
+      },
+    }),
     'browser-local-audio-speech': buildOpenAICompatibleProvider({
       id: 'browser-local-audio-speech',
       name: 'Browser (Local)',
