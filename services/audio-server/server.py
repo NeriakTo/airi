@@ -20,6 +20,7 @@ from contextlib import asynccontextmanager
 
 from pathlib import Path
 
+import mlx.core as mx
 import numpy as np
 import uvicorn
 from fastapi import FastAPI, Request, UploadFile, File, Query
@@ -296,7 +297,7 @@ def _generate_cached_voices() -> None:
         t0 = time.time()
         audio_chunks = []
         for result in model.generate(
-            text=phrase, voice=TTS_VOICE, lang_code="zh",
+            text=phrase, voice=TTS_VOICE, lang_code="chinese",
             verbose=False, stream=False,
         ):
             if hasattr(result, "audio"):
@@ -359,10 +360,17 @@ async def health():
 
 from pydantic import BaseModel
 
+TTS_TEMPERATURE = float(os.environ.get("MEOWVOICE_TTS_TEMPERATURE", "0.5"))
+TTS_SPEED = float(os.environ.get("MEOWVOICE_TTS_SPEED", "1.0"))
+TTS_SEED = int(os.environ.get("MEOWVOICE_TTS_SEED", "42"))
+
 class TtsRequest(BaseModel):
     text: str
     voice: str = TTS_VOICE
-    lang: str = "zh"
+    lang: str = "chinese"
+    temperature: float = TTS_TEMPERATURE
+    speed: float = TTS_SPEED
+    seed: int = TTS_SEED
     # stream 保留供 model.generate() 內部分段用，HTTP 回應一律為完整 WAV
     stream: bool = False
 
@@ -376,10 +384,10 @@ async def tts_generate(req: TtsRequest):
 async def _tts_generate_inner(req: TtsRequest):
     model = load_tts()
     text, voice, lang, stream = req.text, req.voice, req.lang, req.stream
+    temperature, speed = req.temperature, req.speed
     t_start = time.time()
 
-    # MLX Metal tensors are bound to the main-thread GPU stream (stream 0).
-    # All generation must run on the event-loop thread — acceptable for single-user local server.
+    mx.random.seed(req.seed)
     audio_chunks: list[np.ndarray] = []
     chunk_count = 0
     for result in model.generate(
@@ -388,6 +396,8 @@ async def _tts_generate_inner(req: TtsRequest):
         lang_code=lang,
         verbose=False,
         stream=stream,
+        temperature=temperature,
+        speed=speed,
         **({"streaming_interval": 1.0} if stream else {}),
     ):
         if hasattr(result, "audio"):
@@ -793,6 +803,17 @@ async def cached_voice(key: str):
     if not data:
         return JSONResponse({"error": "Voice not yet cached"}, status_code=503)
     return StreamingResponse(io.BytesIO(data), media_type="audio/wav")
+
+
+SEED_PAGE = Path(__file__).parent / "seed-compare.html"
+
+
+@app.get("/seeds", response_class=HTMLResponse)
+async def seed_compare_page():
+    """Seed comparison page for voice tuning."""
+    if SEED_PAGE.exists():
+        return HTMLResponse(SEED_PAGE.read_text(encoding="utf-8"))
+    return HTMLResponse("<h1>seed-compare.html not found</h1>", status_code=404)
 
 
 @app.get("/", response_class=HTMLResponse)

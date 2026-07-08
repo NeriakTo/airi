@@ -240,8 +240,16 @@ function initMic() {
 }
 
 // --- Press-and-hold recording ---
+function unlockTtsEl() {
+  // Mobile browsers require audio elements to be "blessed" by a user gesture.
+  // Play a minimal silent WAV to unlock ttsEl for later programmatic playback.
+  ttsEl.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
+  ttsEl.play().then(function() { ttsEl.pause(); ttsEl.src = ''; }).catch(function() {});
+}
+
 function startRec() {
   if (busy || !pin) return;
+  unlockTtsEl();
   function beginRecording(stream) {
     var mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
       ? 'audio/webm;codecs=opus'
@@ -306,6 +314,15 @@ function onTouchMove(e) {
   }
 }
 
+async function sttRequest(wavBlob, ext) {
+  var form = new FormData();
+  form.append('file', wavBlob, 'v.' + ext);
+  var res = await fetch(server + '/v1/audio/transcriptions?model=breeze-asr-25&language=zh', {
+    method: 'POST', body: form, headers: pinHeaders(), credentials: 'include',
+  });
+  return res;
+}
+
 async function process(blob) {
   busy = true;
   mic.classList.add('busy');
@@ -313,30 +330,41 @@ async function process(blob) {
 
   var wavBlob = blob;
   var ext = blob.type.includes('mp4') ? 'mp4' : blob.type.includes('webm') ? 'webm' : 'wav';
+  var duration = 0;
   if (typeof AudioContext !== 'undefined') {
     var ctx = null;
     try {
       ctx = new AudioContext();
       var decoded = await ctx.decodeAudioData(await blob.arrayBuffer());
+      duration = decoded.duration;
       var pcm = decoded.getChannelData(0);
       wavBlob = new Blob([encodeWAV(pcm, decoded.sampleRate)], { type: 'audio/wav' });
       ext = 'wav';
     } catch (e) {} finally { if (ctx) ctx.close(); }
   }
 
-  // STT
+  if (duration > 0 && duration < 0.5) { msg('s', '錄音太短'); done(); return; }
+
+  // STT with retry
   setPhase('辨識中…');
-  var form = new FormData();
-  form.append('file', wavBlob, 'v.' + ext);
-  try {
-    var sttRes = await fetch(server + '/v1/audio/transcriptions?model=breeze-asr-25&language=zh', {
-      method: 'POST', body: form, headers: pinHeaders(), credentials: 'include',
-    });
-    if (sttRes.status === 401) { msg('s', 'PIN 驗證失敗'); showPinScreen(); done(); return; }
-    var sttData = await sttRes.json();
-    if (!sttData.text || !sttData.text.trim()) { msg('s', '沒聽到'); done(); return; }
-    msg('u', sttData.text);
-  } catch (e) { msg('s', 'STT 失敗'); done(); return; }
+  var sttData = null;
+  for (var attempt = 0; attempt < 2; attempt++) {
+    try {
+      var sttRes = await sttRequest(wavBlob, ext);
+      if (sttRes.status === 401) { msg('s', 'PIN 驗證失敗'); showPinScreen(); done(); return; }
+      sttData = await sttRes.json();
+      if (sttData.text && sttData.text.trim()) break;
+      sttData = null;
+    } catch (e) {
+      sttData = null;
+      if (attempt === 0) {
+        setPhase('重試辨識…');
+        await new Promise(function(r) { setTimeout(r, 1500); });
+      }
+    }
+  }
+  if (!sttData || !sttData.text || !sttData.text.trim()) { msg('s', attempt > 0 ? 'STT 失敗（已重試）' : '沒聽到'); done(); return; }
+  msg('u', sttData.text);
 
   // Inject to Claude Code session via voice plugin
   setPhase('送出指令…');
@@ -386,7 +414,7 @@ async function pollReply(messageId) {
           if (ttsRes.ok) {
             var audioBlob = await ttsRes.blob();
             ttsEl.src = URL.createObjectURL(audioBlob);
-            ttsEl.play().catch(function(){});
+            ttsEl.play().catch(function(e){ console.error('TTS play blocked:', e); });
           }
         } catch (e) {}
         setPhase('');

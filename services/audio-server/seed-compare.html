@@ -1,0 +1,84 @@
+<title>MeowVoice Seed Compare</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { --bg: #111820; --surface: #1a2332; --text: #e2e8f0; --muted: #8a9ab5;
+    --cyan: #1aafa0; --border: #2a3545; --font: system-ui, -apple-system, sans-serif; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: var(--font); background: var(--bg); color: var(--text); padding: 1rem; }
+  h2 { font-size: 1rem; margin-bottom: 0.8rem; }
+  .row { display: flex; align-items: center; gap: 0.6rem; padding: 0.5rem 0.6rem;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 10px; margin-bottom: 0.5rem; }
+  .seed-label { font-weight: 700; font-size: 0.9rem; min-width: 60px; }
+  .play-btn { background: var(--cyan); color: #fff; border: none; border-radius: 8px;
+    padding: 0.4rem 0.8rem; font-size: 0.8rem; cursor: pointer; white-space: nowrap; }
+  .play-btn:disabled { opacity: 0.4; }
+  .status { font-size: 0.7rem; color: var(--muted); flex: 1; }
+  .pick-btn { background: transparent; color: var(--cyan); border: 1px solid var(--cyan); border-radius: 8px;
+    padding: 0.3rem 0.6rem; font-size: 0.75rem; cursor: pointer; }
+  .picked { background: var(--cyan); color: #fff; }
+  audio { display: none; }
+  .info { font-size: 0.75rem; color: var(--muted); margin-bottom: 1rem; }
+</style>
+
+<h2>MeowVoice Seed 試聽</h2>
+<div class="info">點「播放」試聽不同 seed 的音色，找到喜歡的按「選用」。</div>
+<div id="list"></div>
+<audio id="au"></audio>
+
+<script>
+var server = window.location.origin;
+var seeds = [10, 20, 30, 42, 50, 60, 70, 80, 88, 99];
+var testText = '你好 Kevin，今天我們把語音管道修好了，後面可以用語音更快速地下指令。';
+var au = document.getElementById('au');
+var list = document.getElementById('list');
+var playing = null;
+
+seeds.forEach(function(seed) {
+  var row = document.createElement('div');
+  row.className = 'row';
+  row.innerHTML =
+    '<span class="seed-label">Seed ' + seed + '</span>' +
+    '<button class="play-btn" id="play-' + seed + '">播放</button>' +
+    '<span class="status" id="st-' + seed + '"></span>' +
+    '<button class="pick-btn" id="pick-' + seed + '">選用</button>';
+  list.appendChild(row);
+
+  document.getElementById('play-' + seed).onclick = function() { generate(seed); };
+  document.getElementById('pick-' + seed).onclick = function() { pickSeed(seed); };
+});
+
+async function generate(seed) {
+  if (playing) return;
+  playing = seed;
+  var btn = document.getElementById('play-' + seed);
+  var st = document.getElementById('st-' + seed);
+  btn.disabled = true;
+  st.textContent = '合成中…';
+
+  try {
+    var res = await fetch(server + '/tts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: testText, voice: 'serena', lang: 'chinese', seed: seed, temperature: 0.5, speed: 1.1 }),
+    });
+    if (!res.ok) { st.textContent = '失敗 ' + res.status; return; }
+    var blob = await res.blob();
+    au.src = URL.createObjectURL(blob);
+    st.textContent = '播放中…';
+    au.play();
+    au.onended = function() { st.textContent = '完成'; playing = null; btn.disabled = false; };
+  } catch (e) {
+    st.textContent = '錯誤';
+    playing = null;
+    btn.disabled = false;
+  }
+}
+
+function pickSeed(seed) {
+  document.querySelectorAll('.pick-btn').forEach(function(b) { b.classList.remove('picked'); b.textContent = '選用'; });
+  var btn = document.getElementById('pick-' + seed);
+  btn.classList.add('picked');
+  btn.textContent = '已選 ✓';
+}
+</script>
