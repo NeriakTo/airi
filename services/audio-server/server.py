@@ -29,6 +29,7 @@ from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 import httpx
 
 from dedup import DedupCache
+from fast_voice import FastVoiceEngine, load_persona
 
 logger = logging.getLogger("meowvoice-audio")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -68,6 +69,14 @@ DISPATCH_TIMEOUT = int(os.environ.get("MEOWVOICE_DISPATCH_TIMEOUT", "60"))
 VOICE_PIN = os.environ.get("MEOWVOICE_PIN", "")
 _BRIDGE_PIN = VOICE_PIN  # kept for localhost bridge auth after _init_pin_storage clears VOICE_PIN
 VOICE_PLUGIN_URL = os.environ.get("MEOWVOICE_VOICE_PLUGIN", "http://127.0.0.1:8401")
+
+# fast-voice adapter（灰喵本機 llama.cpp，見 fast_voice.py 模組說明）
+FASTVOICE_LLAMA_URL = os.environ.get(
+    "MEOWVOICE_FASTVOICE_LLAMA_URL", "http://127.0.0.1:8000/v1/chat/completions"
+)
+# 8s＝規劃 §4 的 fallback 門檻：超過就該讓 P2 轉 claude-code，不是繼續等
+FASTVOICE_TIMEOUT = float(os.environ.get("MEOWVOICE_FASTVOICE_TIMEOUT", "8"))
+_fast_voice = FastVoiceEngine(FASTVOICE_LLAMA_URL, load_persona(), timeout=FASTVOICE_TIMEOUT)
 
 # --- PIN security infrastructure ---
 _MEOWVOICE_DIR = Path.home() / ".meowvoice"
@@ -712,6 +721,49 @@ async def voice_dispatch(request: Request, req: VoiceDispatchRequest):
     _dedup_cache.store(req.client_msg_id, cleaned, response)
     logger.info("Voice injected: message_id=%s elapsed=%.1fs", message_id, elapsed)
     return response
+
+
+class RuntimeDispatchRequest(BaseModel):
+    """Runtime adapter 協定的入站格式（與 gateway 對 mcp-bridge 的 POST 同形）。"""
+    text: str
+    callback_url: str
+    user: str = ""
+
+
+# create_task 的背景任務只留弱引用會被 GC 吃掉，這裡持有到完成為止
+_fast_voice_tasks: set[asyncio.Task] = set()
+
+
+@app.post("/runtime/fast-voice")
+async def fast_voice_dispatch(request: Request, req: RuntimeDispatchRequest):
+    """fast-voice runtime adapter：先回 message_id，回覆走 callback（協定同 mcp-bridge）。"""
+    if not _check_pin(request):
+        return JSONResponse({"error": "Invalid PIN"}, status_code=401)
+    message_id = _fast_voice.next_message_id()
+    task = asyncio.create_task(_fast_voice_run(req.text, req.callback_url, message_id))
+    _fast_voice_tasks.add(task)
+    task.add_done_callback(_fast_voice_tasks.discard)
+    return {"message_id": message_id}
+
+
+async def _fast_voice_run(text: str, callback_url: str, message_id: str) -> None:
+    """背景推理＋回投 callback。失敗時回誠實的故障提示——P2 會把這條
+    錯誤路徑換成自動轉送 claude-code runtime 的 fallback。"""
+    try:
+        reply = await _fast_voice.generate(_http_client, text)
+    except Exception as e:
+        logger.error("fast-voice generate failed: %s", e)
+        reply = "語音快線暫時出狀況，這句我沒有處理到，麻煩再說一次。"
+    try:
+        resp = await _http_client.post(
+            callback_url,
+            json={"text": reply, "message_id": message_id, "runtime_id": "fast-voice"},
+            headers={"X-Voice-Pin": _BRIDGE_PIN},
+        )
+        if not resp.is_success:
+            logger.error("fast-voice callback rejected: %s %s", resp.status_code, resp.text[:200])
+    except Exception as e:
+        logger.error("fast-voice callback failed: %s", e)
 
 
 class VoiceReplyCallback(BaseModel):
