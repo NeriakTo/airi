@@ -119,12 +119,14 @@ var pinInput = document.getElementById('pinInput');
 var pinErr = document.getElementById('pinErr');
 var cancelHint = document.getElementById('cancelHint');
 var busy = false;
+var busySince = 0;
 var recorder = null;
 var micStream = null;
 var chunks = [];
 var touchStartY = 0;
 var cancelThreshold = 80;
 var isCancelled = false;
+var dispatchAbort = null;
 
 function pinHeaders() {
   if (hasSession) return {};
@@ -342,6 +344,7 @@ async function sttRequest(wavBlob, ext) {
 
 async function process(blob) {
   busy = true;
+  busySince = Date.now();
   mic.classList.add('busy');
   hint.textContent = '';
 
@@ -404,15 +407,25 @@ async function process(blob) {
   setPhase('送出指令…');
   playFeedback('ack');
 
+  // 每句語音一個唯一識別碼——iOS 喚醒後若網路層重放同一個 POST，
+  // 伺服器據此去重，同一句話絕不注入兩次
+  var clientMsgId = (window.crypto && crypto.randomUUID)
+    ? crypto.randomUUID()
+    : Date.now() + '-' + Math.random().toString(16).slice(2);
   try {
+    dispatchAbort = new AbortController();
     var dRes = await fetch(server + '/voice/dispatch', {
       method: 'POST',
       headers: Object.assign({ 'Content-Type': 'application/json' }, pinHeaders()),
-      body: JSON.stringify({ text: sttData.text }),
+      body: JSON.stringify({ text: sttData.text, client_msg_id: clientMsgId }),
       credentials: 'include',
+      signal: dispatchAbort.signal,
     });
+    dispatchAbort = null;
     if (dRes.status === 401) { msg('s', 'PIN 驗證失敗'); stopFeedback(); showPinScreen(); done(); return; }
     var dData = await dRes.json();
+
+    if (dData.duplicate) { msg('s', '此指令剛已送出過，略過重發'); stopFeedback(); done(); return; }
 
     if (dData.injected) {
       msg('s', '已送達青喵');
@@ -423,11 +436,30 @@ async function process(blob) {
       msg('s', '送出失敗: ' + (dData.error || '未知錯誤'));
     }
   } catch (e) {
+    dispatchAbort = null;
     stopFeedback();
-    msg('s', '連線失敗');
+    msg('s', e && e.name === 'AbortError' ? '頁面切換，指令已中止，請重新說一次' : '連線失敗');
   }
   done();
 }
+
+// iOS 鎖屏會凍結頁面並回收連線；喚醒後 Safari 可能重放尚未收到回應的 POST
+// （2026-07-17 實案：同一句語音間隔 17 分鐘注入兩次）。頁面隱藏時主動中止
+// in-flight dispatch，讓網路層沒有可重放的請求；伺服器端另有 client_msg_id
+// 去重兜底。
+document.addEventListener('visibilitychange', function() {
+  if (document.visibilityState === 'hidden') {
+    if (dispatchAbort) {
+      try { dispatchAbort.abort(); } catch (e) {}
+      dispatchAbort = null;
+    }
+  } else if (busy && busySince && Date.now() - busySince > 180000) {
+    // 喚醒後 busy 卡超過 3 分鐘＝流程死在鎖屏期間，重置 UI 與麥克風
+    resetMic();
+    done();
+    msg('s', '已重置（鎖屏中斷了上一個流程），請重新按住說話');
+  }
+});
 
 async function pollReply(messageId) {
   setPhase('等待回覆…');
@@ -462,6 +494,7 @@ async function pollReply(messageId) {
 
 function done() {
   busy = false;
+  busySince = 0;
   mic.classList.remove('busy');
   hint.textContent = '按住說話';
   setPhase('');

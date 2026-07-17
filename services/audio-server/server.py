@@ -28,8 +28,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 import httpx
 
+from dedup import DedupCache
+
 logger = logging.getLogger("meowvoice-audio")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+# dispatch 冪等快取（iOS 喚醒重放防護，見 dedup.py）
+_dedup_cache = DedupCache()
 
 
 def _load_dotenv():
@@ -594,6 +599,7 @@ class VoiceDispatchRequest(BaseModel):
     text: str
     channel_hint: str = ""
     runtime: str | None = None
+    client_msg_id: str = ""
 
 
 def _check_pin(request: Request) -> bool:
@@ -674,11 +680,21 @@ async def voice_dispatch(request: Request, req: VoiceDispatchRequest):
     if req.channel_hint:
         target_channel = req.channel_hint
 
+    # 冪等去重：iOS 喚醒後可能重放同一個 POST（見 dedup.py 模組說明）。
+    # 命中時回傳首次結果並標 duplicate，絕不重複注入。
+    cached = _dedup_cache.lookup(req.client_msg_id, cleaned)
+    if cached is not None:
+        logger.warning(
+            "Voice inject duplicate suppressed: client_msg_id=%s text=%r",
+            req.client_msg_id or "(text-hash)", cleaned[:60],
+        )
+        return {**cached, "duplicate": True}
+
     display_text = cleaned
     if target_channel != VOICE_CHANNEL_ID:
         display_text = f"[→ <#{target_channel}>] {cleaned}"
 
-    logger.info("Voice inject: text=%r", cleaned[:60])
+    logger.info("Voice inject: client_msg_id=%s text=%r", req.client_msg_id, cleaned[:60])
     t_start = time.time()
 
     result = await _dispatch_to_runtime(cleaned, req.runtime)
@@ -692,8 +708,10 @@ async def voice_dispatch(request: Request, req: VoiceDispatchRequest):
         asyncio.create_task(_discord_post_webhook(display_text))
 
     message_id = result.get("message_id", "")
+    response = {"injected": True, "message_id": message_id, "elapsed": elapsed}
+    _dedup_cache.store(req.client_msg_id, cleaned, response)
     logger.info("Voice injected: message_id=%s elapsed=%.1fs", message_id, elapsed)
-    return {"injected": True, "message_id": message_id, "elapsed": elapsed}
+    return response
 
 
 class VoiceReplyCallback(BaseModel):
