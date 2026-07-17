@@ -29,7 +29,7 @@ from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 import httpx
 
 from dedup import DedupCache
-from fast_voice import FastVoiceEngine, load_persona
+from fast_voice import EscalationAliases, FastVoiceEngine, load_persona
 
 logger = logging.getLogger("meowvoice-audio")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -77,6 +77,7 @@ FASTVOICE_LLAMA_URL = os.environ.get(
 # 8s＝規劃 §4 的 fallback 門檻：超過就該讓 P2 轉 claude-code，不是繼續等
 FASTVOICE_TIMEOUT = float(os.environ.get("MEOWVOICE_FASTVOICE_TIMEOUT", "8"))
 _fast_voice = FastVoiceEngine(FASTVOICE_LLAMA_URL, load_persona(), timeout=FASTVOICE_TIMEOUT)
+_escalation_aliases = EscalationAliases()
 
 # --- PIN security infrastructure ---
 _MEOWVOICE_DIR = Path.home() / ".meowvoice"
@@ -747,13 +748,20 @@ async def fast_voice_dispatch(request: Request, req: RuntimeDispatchRequest):
 
 
 async def _fast_voice_run(text: str, callback_url: str, message_id: str) -> None:
-    """背景推理＋回投 callback。失敗時回誠實的故障提示——P2 會把這條
-    錯誤路徑換成自動轉送 claude-code runtime 的 fallback。"""
+    """背景判斷＋回投。reply 直接 callback；escalate（含灰喵故障 fallback）
+    轉送 claude-code runtime，回覆靠 EscalationAliases 換回原 message_id。"""
     try:
-        reply = await _fast_voice.generate(_http_client, text)
+        action, reply = await _fast_voice.decide(_http_client, text)
     except Exception as e:
-        logger.error("fast-voice generate failed: %s", e)
-        reply = "語音快線暫時出狀況，這句我沒有處理到，麻煩再說一次。"
+        # 灰喵逾時或掛掉不能讓語音斷線——一律升級主 session（規劃 §4 fallback）
+        logger.error("fast-voice decide failed, falling back to escalate: %s", e)
+        action, reply = "escalate", None
+
+    if action == "escalate":
+        if await _escalate_to_claude_code(text, message_id):
+            return
+        reply = "語音快線和主系統都聯絡不上，這句我沒有處理到，麻煩稍後再試。"
+
     try:
         resp = await _http_client.post(
             callback_url,
@@ -764,6 +772,32 @@ async def _fast_voice_run(text: str, callback_url: str, message_id: str) -> None
             logger.error("fast-voice callback rejected: %s %s", resp.status_code, resp.text[:200])
     except Exception as e:
         logger.error("fast-voice callback failed: %s", e)
+
+
+async def _escalate_to_claude_code(text: str, original_id: str) -> bool:
+    """把語音原文轉送 claude-code runtime，並把 bridge 自鑄的 message_id
+    別名到原始 id 上（PWA 輪詢不換號）。成功回 True。"""
+    runtime = _gateway_config.get("runtimes", {}).get("claude-code", {})
+    url = runtime.get("url", f"{VOICE_PLUGIN_URL}/inject")
+    if not runtime.get("enabled", True):
+        logger.error("fast-voice escalate impossible: claude-code runtime disabled")
+        return False
+    try:
+        resp = await _http_client.post(
+            url,
+            json={"text": text, "user": "Kevin"},
+            headers={"X-Voice-Pin": _BRIDGE_PIN},
+        )
+        bridge_id = resp.json().get("message_id", "")
+        if not resp.is_success or not bridge_id:
+            logger.error("fast-voice escalate rejected: %s %s", resp.status_code, resp.text[:200])
+            return False
+    except Exception as e:
+        logger.error("fast-voice escalate failed: %s", e)
+        return False
+    _escalation_aliases.register(bridge_id, original_id)
+    logger.info("fast-voice escalated: %s -> %s text=%r", bridge_id, original_id, text[:40])
+    return True
 
 
 class VoiceReplyCallback(BaseModel):
@@ -787,7 +821,9 @@ async def voice_reply_callback(request: Request, req: VoiceReplyCallback):
     logger.info("Voice reply [%s]: text=%r", source, req.text[:60])
 
     if req.message_id:
-        _pending_replies[req.message_id] = (req.text, time.time())
+        # 升級轉送的回覆帶的是 bridge 自鑄 id，換回 PWA 輪詢的原始 id
+        store_id = _escalation_aliases.resolve(req.message_id)
+        _pending_replies[store_id] = (req.text, time.time())
         # evict old entries (>5 min)
         cutoff = time.time() - 300
         for k in [k for k, v in _pending_replies.items() if v[1] < cutoff]:

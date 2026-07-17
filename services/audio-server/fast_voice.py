@@ -11,6 +11,7 @@ PWA 與既有 runtime adapter（mcp-bridge）完全同形，前端零改動。
 """
 
 import itertools
+import json
 import logging
 import re
 import time
@@ -24,6 +25,40 @@ PERSONA_FILE = Path(__file__).parent / "persona-cyanmeow.txt"
 
 # thinking 開啟時單句 20.3 秒不可用；關閉後暖機 1.05–1.64 秒（2026-07-17 實測）
 LLAMA_EXTRA = {"chat_template_kwargs": {"enable_thinking": False}}
+
+# 保底關鍵字表（規劃 §3.3 決策點 3）：命中即升級主 session，不給模型判斷
+# 機會——任務型指令誤留在灰喵的代價（幻覺假執行）遠高於誤升級（只是變慢）。
+ESCALATE_KEYWORDS = (
+    "dispatch", "部署", "重啟", "restart", "commit", "push", "rollback", "回滾",
+    "排程", "cron", "上線", "發布", "記憶", "快照", "備份", "測試", "build",
+    "執行", "安裝", "更新", "刪除", "檔案", "報告", "整理",
+)
+
+# 升級判斷的輸出契約，跑在 persona 之後——persona 檔維持 Kevin 定稿原文，
+# 工程指令不混進去
+DECISION_SUFFIX = """
+輸出規則：你必須輸出一個 JSON 物件 {"action": "...", "text": "..."}。
+如果這句話是問候、閒聊、想法討論、情緒分享、請你給建議這類純對話，action 填 "reply"，text 填你要對 Kevin 說的話，照上面說話方式的規則。
+如果這句話需要查資料、看即時狀態、操作系統、執行任務、讀寫記憶或檔案、排程、部署、開發相關動作，action 填 "escalate"，text 填空字串，這句話會轉給主系統處理。
+拿不準的時候一律選 escalate。
+"""
+
+DECISION_SCHEMA = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "voice_decision",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["reply", "escalate"]},
+                "text": {"type": "string"},
+            },
+            "required": ["action", "text"],
+            "additionalProperties": False,
+        },
+    },
+}
 
 
 def load_persona(path: Path = PERSONA_FILE) -> str:
@@ -91,9 +126,24 @@ class FastVoiceEngine:
         """與 mcp-bridge 的 voice-{ms}-{n} 同形，來源可從前綴區分。"""
         return f"fastvoice-{int(time.time() * 1000)}-{next(self._counter)}"
 
-    async def generate(self, client: httpx.AsyncClient, text: str) -> str:
-        """單句推理。逾時或 HTTP 錯誤直接拋出——P2 在呼叫端接 fallback。"""
-        messages = [{"role": "system", "content": self._persona}]
+    @staticmethod
+    def keyword_escalation(text: str) -> str | None:
+        """回傳命中的保底關鍵字（無命中回 None）。"""
+        lower = text.lower()
+        return next((kw for kw in ESCALATE_KEYWORDS if kw in lower), None)
+
+    async def decide(self, client: httpx.AsyncClient, text: str) -> tuple[str, str | None]:
+        """單句判斷＋回覆，單次 llama 呼叫。
+
+        回傳 ("reply", 回覆文字) 或 ("escalate", None)。逾時或 HTTP 錯誤
+        直接拋出——呼叫端把例外也當 escalate 處理（fallback）。
+        """
+        kw = self.keyword_escalation(text)
+        if kw:
+            logger.info("fast-voice escalate (keyword=%r): text=%r", kw, text[:40])
+            return ("escalate", None)
+
+        messages = [{"role": "system", "content": self._persona + "\n" + DECISION_SUFFIX}]
         messages += self.history.messages()
         messages.append({"role": "user", "content": text})
 
@@ -105,20 +155,54 @@ class FastVoiceEngine:
                 "messages": messages,
                 "temperature": self._temperature,
                 "max_tokens": self._max_tokens,
+                "response_format": DECISION_SCHEMA,
                 **LLAMA_EXTRA,
             },
             timeout=self._timeout,
         )
         resp.raise_for_status()
-        reply = resp.json()["choices"][0]["message"]["content"].strip()
+        decision = json.loads(resp.json()["choices"][0]["message"]["content"])
+        elapsed = time.time() - t_start
+
+        if decision["action"] == "escalate":
+            logger.info("fast-voice escalate (model, %.2fs): text=%r", elapsed, text[:40])
+            return ("escalate", None)
+
         # 換行會讓 TTS 韻律斷裂不協調（2026-07-17 Kevin 聽測回饋）；句子
         # 本身已帶標點，直接把換行收掉成連續段落
-        reply = re.sub(r"\s*\n+\s*", "", reply)
+        reply = re.sub(r"\s*\n+\s*", "", decision["text"].strip())
         if not reply:
-            raise ValueError("fast-voice: empty completion from llama.cpp")
+            raise ValueError("fast-voice: empty reply text from llama.cpp")
         logger.info(
-            "fast-voice reply: %.2fs text=%r reply=%r",
-            time.time() - t_start, text[:40], reply[:60],
+            "fast-voice reply: %.2fs text=%r reply=%r", elapsed, text[:40], reply[:60],
         )
         self.history.append_exchange(text, reply)
-        return reply
+        return ("reply", reply)
+
+
+class EscalationAliases:
+    """升級轉送的 message_id 別名表。
+
+    mcp-bridge /inject 一律自鑄 message_id（server.ts:91 不收外部值），而
+    PWA 輪詢的是 fast-voice 原始 id。轉送時記 bridge_id → 原始 id，主
+    session 的 voice_reply callback 進來時換回原始 id，前端零改動。
+    """
+
+    def __init__(self, ttl: float = 300.0):
+        self._ttl = ttl
+        self._aliases: dict[str, tuple[str, float]] = {}
+
+    def register(self, bridge_id: str, original_id: str, now: float | None = None) -> None:
+        now = time.time() if now is None else now
+        self._aliases = {
+            k: v for k, v in self._aliases.items() if now - v[1] <= self._ttl
+        }
+        self._aliases[bridge_id] = (original_id, now)
+
+    def resolve(self, message_id: str, now: float | None = None) -> str:
+        """有別名回原始 id（一次性），沒有就原樣回傳。"""
+        now = time.time() if now is None else now
+        hit = self._aliases.pop(message_id, None)
+        if hit is None or now - hit[1] > self._ttl:
+            return message_id
+        return hit[0]
