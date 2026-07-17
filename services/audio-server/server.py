@@ -438,23 +438,36 @@ async def stt_transcribe(
     suffix = Path(file.filename).suffix if file.filename else ".wav"
     if not suffix:
         suffix = ".wav"
+    content = await file.read()
+    # iOS 麥克風 track 靜默失效時，前端會送出空的或缺檔頭的錄音檔——
+    # 這是客戶端問題，回 400 讓前端引導重錄，不能落 500 traceback
+    if len(content) < 100:
+        logger.warning("STT rejected: audio too small (%d bytes, suffix=%s)", len(content), suffix)
+        return JSONResponse({"error": "audio_decode_failed", "detail": "audio too small"}, status_code=400)
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        content = await file.read()
         tmp.write(content)
         tmp_path = tmp.name
 
     try:
         prompt = build_stt_prompt(channel_id)
-        async with _stt_lock:
-            result = mlx_whisper.transcribe(
-                tmp_path,
-                path_or_hf_repo=stt_model_id,
-                language=lang,
-                verbose=False,
-                initial_prompt=prompt,
-                # Breeze-ASR-25 短語音場景 True 可提升連貫性；長錄音有幻覺傳播風險
-                condition_on_previous_text=True,
-            )
+        try:
+            async with _stt_lock:
+                result = mlx_whisper.transcribe(
+                    tmp_path,
+                    path_or_hf_repo=stt_model_id,
+                    language=lang,
+                    verbose=False,
+                    initial_prompt=prompt,
+                    # Breeze-ASR-25 短語音場景 True 可提升連貫性；長錄音有幻覺傳播風險
+                    condition_on_previous_text=True,
+                )
+        except RuntimeError as e:
+            # mlx_whisper 對 ffmpeg 解不開的音檔拋 "Failed to load audio"；
+            # 其他 RuntimeError 屬伺服器側問題，照舊往上拋成 500
+            if "Failed to load audio" in str(e):
+                logger.warning("STT audio decode failed: size=%d suffix=%s", len(content), suffix)
+                return JSONResponse({"error": "audio_decode_failed", "detail": "undecodable audio"}, status_code=400)
+            raise
         text = result.get("text", "").strip()
         duration = time.time() - t_start
         logger.info("STT done: text=%r time=%.2fs prompt_channel=%s", text[:50], duration, channel_id or "default")

@@ -239,6 +239,22 @@ function initMic() {
   }).catch(function() {});
 }
 
+// iOS 在 TTS 播放或頁面切到背景後，會靜默停掉快取的麥克風 track——
+// stream.active 仍是 true，但錄出來的是缺 EBML 檔頭的壞檔。
+// 錄音前必須驗 track 本身的健康度，不健康就整個重新取得。
+function micHealthy() {
+  if (!micStream || !micStream.active) return false;
+  var t = micStream.getAudioTracks()[0];
+  return !!t && t.readyState === 'live' && !t.muted;
+}
+
+function resetMic() {
+  if (micStream) {
+    try { micStream.getTracks().forEach(function(t) { t.stop(); }); } catch (e) {}
+  }
+  micStream = null;
+}
+
 // --- Press-and-hold recording ---
 function unlockTtsEl() {
   // Mobile browsers require audio elements to be "blessed" by a user gesture.
@@ -271,9 +287,10 @@ function startRec() {
     hint.textContent = '放開送出';
     setPhase('錄音中…');
   }
-  if (micStream && micStream.active) {
+  if (micHealthy()) {
     beginRecording(micStream);
   } else {
+    resetMic();
     navigator.mediaDevices.getUserMedia({ audio: true }).then(function(stream) {
       micStream = stream;
       beginRecording(stream);
@@ -328,6 +345,15 @@ async function process(blob) {
   mic.classList.add('busy');
   hint.textContent = '';
 
+  // 麥克風 track 失效時 MediaRecorder 會產出近乎空白的 blob——攔在上傳前，
+  // 並丟棄快取 stream，讓下一次按住時重新取得健康的麥克風
+  if (blob.size < 1024) {
+    resetMic();
+    msg('s', '錄音沒有內容（麥克風可能被系統暫停），請再按住說一次');
+    done();
+    return;
+  }
+
   var wavBlob = blob;
   var ext = blob.type.includes('mp4') ? 'mp4' : blob.type.includes('webm') ? 'webm' : 'wav';
   var duration = 0;
@@ -352,6 +378,14 @@ async function process(blob) {
     try {
       var sttRes = await sttRequest(wavBlob, ext);
       if (sttRes.status === 401) { msg('s', 'PIN 驗證失敗'); showPinScreen(); done(); return; }
+      // 400＝音檔本身壞掉（麥克風 track 失效），重試同一個檔必敗——
+      // 直接重置麥克風請使用者重錄
+      if (sttRes.status === 400) {
+        resetMic();
+        msg('s', '錄音檔無法辨識（麥克風可能被系統暫停），請再按住說一次');
+        done();
+        return;
+      }
       sttData = await sttRes.json();
       if (sttData.text && sttData.text.trim()) break;
       sttData = null;
