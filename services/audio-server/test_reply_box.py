@@ -206,6 +206,50 @@ def test_active_ids_lists_current_and_excludes_expired(tmp_path):
     assert box.active_ids(now=DEFAULT_WINDOW_SECONDS + 100) == ["new"]
 
 
+# --- 未讀補取列表（票 6-4，唯讀查詢，倒序＋上限）---
+
+
+def test_list_recent_time_descending(tmp_path):
+    box = _box(tmp_path)
+    box.enqueue("a", "先", now=1000.0)
+    box.enqueue("b", "中", now=1001.0)
+    box.enqueue("c", "後", now=1002.0)
+    ids = [row[0] for row in box.list_recent(now=1003.0)]
+    assert ids == ["c", "b", "a"]  # created_at 倒序（新→舊）
+
+
+def test_list_recent_caps_at_max_entries(tmp_path):
+    # 一頁上限＝滾動窗 max_entries；入匣已砍超窗，列表亦不逾一頁。
+    box = _box(tmp_path, max_entries=20)
+    for i in range(25):
+        box.enqueue(f"r{i:02d}", f"文字{i}", now=1000.0 + i)
+    rows = box.list_recent(now=1030.0)
+    assert len(rows) == 20
+    assert rows[0][0] == "r24"  # 最新在最前
+    assert rows[-1][0] == "r05"  # 最舊 5 筆（r00-r04）已被滾動窗砍
+
+
+def test_list_recent_returns_text_and_state(tmp_path):
+    box = _box(tmp_path)
+    box.enqueue("a", "回覆內容", now=1000.0)
+    box.ack("a", ReplyState.READ, now=1001.0)
+    (rid, text, state, created_at) = box.list_recent(now=1002.0)[0]
+    assert rid == "a"
+    assert text == "回覆內容"
+    assert state is ReplyState.READ  # 反映當前 ACK 態
+    assert created_at == 1000.0
+
+
+def test_list_recent_excludes_expired_and_readonly(tmp_path):
+    box = _box(tmp_path, max_entries=100)  # 隔離時間維度
+    box.enqueue("old", "舊", now=0.0)
+    box.enqueue("new", "新", now=DEFAULT_WINDOW_SECONDS + 100)
+    rows = box.list_recent(now=DEFAULT_WINDOW_SECONDS + 100)
+    assert [r[0] for r in rows] == ["new"]  # 到期者不列
+    # 唯讀：列表呼叫不改 new 的 ACK 態（仍 delivered）
+    assert box.get("new", now=DEFAULT_WINDOW_SECONDS + 100)[1] is ReplyState.DELIVERED
+
+
 # --- 清除 hook（供票 6-3 快取檔連動刪除）---
 
 

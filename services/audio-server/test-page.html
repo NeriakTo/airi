@@ -30,6 +30,15 @@
   .bubble .t { font-size: 0.6rem; color: var(--muted); margin-top: 0.2rem; }
   .bubble.u .t { color: rgba(255,255,255,0.6); }
 
+  /* 未讀補取列表（票 6-4）：未 played 為未讀樣式（青邊）；文字摘要先行，
+     點播按需播放，播放完成才轉已讀。 */
+  .bubble.reply { display: flex; flex-direction: column; gap: 0.4rem; }
+  .bubble.reply.unread { border-color: var(--cyan); box-shadow: 0 0 0 1px var(--cyan-dim); }
+  .bubble.reply .play-btn { align-self: flex-start; font-family: var(--font); font-size: 0.72rem;
+    color: var(--cyan); background: var(--cyan-dim); border: 1px solid var(--cyan);
+    border-radius: 12px; padding: 0.22rem 0.75rem; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+  .bubble.reply .play-btn:disabled { opacity: 0.5; }
+
   .mic-area { position: relative; padding: 1rem; padding-bottom: max(1.2rem, env(safe-area-inset-bottom));
     display: flex; flex-direction: column; align-items: center; gap: 0.5rem; }
 
@@ -127,6 +136,18 @@ var touchStartY = 0;
 var cancelThreshold = 80;
 var isCancelled = false;
 var dispatchAbort = null;
+// 未讀補取（票 6-4）：renderedReplies 去重（重開不重複渲染，live 與補取共用同一路徑）；
+// ackedRead 記「read ACK 已成功落匣」的 id（成功才記，失敗留待重試）；readInflight 防同一筆
+// read ACK 並發重送；activePlayback 記當前佔用 ttsEl 的播放（單一播放器互斥）。
+var renderedReplies = {};
+var ackedRead = {};
+var readInflight = {};
+var activePlayback = null;
+// playedPending：UI 已播完但 played ACK 未落匣的 id（O3）；下次補取比對 server 態
+// 仍非 played 時重發（不重播音訊）。playedRetryInflight：per-ID 重送鎖（Q1），
+// 重疊兩次 loadReplies() 不對同筆併發重送。
+var playedPending = {};
+var playedRetryInflight = {};
 
 function pinHeaders() {
   if (hasSession) return {};
@@ -164,6 +185,196 @@ function encodeWAV(samples, sr) {
 function playFeedback(key) { fbEl.src = server + '/voice/cached/' + key; fbEl.play().catch(function(){}); }
 function stopFeedback() { fbEl.pause(); fbEl.src = ''; }
 
+// --- 回覆協調器（票 6-4）：live（等當下回覆）與補取（重開未讀）收斂到同一
+//     渲染函數 renderReply ＋單一播放器 playReply，per-id 去重、播放互斥。
+//     文字摘要先行、點播按需播放；read ACK 逐筆入視窗（成功才記旗標、失敗重試）；
+//     played ACK 綁「播放完成」ended 事件（非開始、失敗不報、可重播）。
+
+function ackReply(id, state) {
+  // 顯式 ACK；走 reply_box 冪等單調語意。回 Promise<boolean>（HTTP ok 為 true），
+  // 供 read ACK 判斷是否成功落匣（決定要不要記旗標／重試）。
+  return fetch(server + '/voice/reply/' + encodeURIComponent(id) + '/ack', {
+    method: 'POST',
+    headers: Object.assign({ 'Content-Type': 'application/json' }, pinHeaders()),
+    body: JSON.stringify({ state: state }),
+    credentials: 'include',
+  }).then(function(r) { return r.ok; }).catch(function() { return false; });
+}
+
+// read ACK：HTTP 成功才設 ackedRead[id]（N4）——失敗不設旗標，保留 observe 與下次
+// 補取兩條重試路徑。readInflight 防同一筆並發重送。
+function sendReadAck(id) {
+  if (ackedRead[id] || readInflight[id]) return;
+  readInflight[id] = true;
+  ackReply(id, 'read').then(function(ok) {
+    readInflight[id] = false;
+    if (ok) ackedRead[id] = true;  // 只有落匣成功才短路後續重試
+  });
+}
+
+// 逐筆入視窗才回報 read ACK（IntersectionObserver 忠實對應「入視窗時」語意）。
+// 已 played 者不回退標記為 read（一次性 unobserve）；未成功者不 unobserve，
+// 滑走再入視窗會再觸發＝IO 側重試路徑。
+var readObserver = ('IntersectionObserver' in window)
+  ? new IntersectionObserver(function(entries) {
+      entries.forEach(function(en) {
+        if (!en.isIntersecting) return;
+        var id = en.target.dataset.id;
+        if (en.target.dataset.played === '1' || ackedRead[id]) { readObserver.unobserve(en.target); return; }
+        sendReadAck(id);  // 成功後由 ackedRead 短路，失敗保留 observe 待再次入視窗
+      });
+    }, { root: chat, threshold: 0.4 })
+  : null;
+
+function btnIdle(bubble) { return bubble.dataset.played === '1' ? '▶ 重播' : '▶ 播放'; }
+
+// 停掉當前播放：呼叫該筆 rec 自身的清場（pause＋清 handlers＋revoke），未觸發
+// ended＝未完成＝不誤發 played；並還原其按鈕。開新播前先停舊筆＝互斥（O1）。
+function stopActivePlayback() {
+  if (!activePlayback) return;
+  var p = activePlayback;
+  p.cleanup();  // cleanup 內若 activePlayback===p 會置 null
+  if (p.btn) { p.btn.disabled = false; p.btn.textContent = btnIdle(p.bubble); }
+}
+
+// O3：ended 後回報 played ACK，檢查結果；失敗＝標 playedPending，下次補取比對
+// server 態仍非 played 時重發（不重播音訊）。played 只在此、且只在真實 ended 後回報。
+function markPlayedAndAck(id) {
+  ackReply(id, 'played').then(function(ok) { if (!ok) playedPending[id] = true; });
+}
+
+function retryPlayedAck(id) {
+  // 補取側重試：UI 已播（playedPending）但匣內仍非 played，重發 played ACK，不重播。
+  // Q1 per-ID inflight 鎖：重疊兩次 loadReplies() 對同筆只在途一次，完成才釋放
+  // （成功清 pending／失敗保留 pending 待下次補取重試）。
+  if (playedRetryInflight[id]) return;
+  playedRetryInflight[id] = true;
+  ackReply(id, 'played').then(function(ok) {
+    playedRetryInflight[id] = false;
+    if (ok) delete playedPending[id];
+  });
+}
+
+function playReply(id, bubble, btn) {
+  // O1：per-reply 專屬 new Audio 實例——單次使用、handlers 綁實例、結束／錯誤／
+  // reject 收斂到單一清場 rec.cleanup（finally 語意：pause＋清 handlers＋revoke＋
+  // 僅本次才清 activePlayback）。跨 ID 天然隔離：A 的任何延遲操作只碰自己的 rec，
+  // 碰不到 B 的實例。共用 ttsEl 的 unlock 儀式只 bless 音訊 session，不觸碰任何
+  // reply 播放實例。播放互斥由 activePlayback 管（開新播先停舊筆自身清場）。
+  if (activePlayback && activePlayback.id === id) return;  // 已在播同一筆，忽略重複點
+  unlockTtsEl();          // bless 音訊 session（碰 ttsEl，非 reply 實例）；點播 gesture 內同步
+  stopActivePlayback();   // 互斥：停舊筆（呼叫舊 rec 自身清場，不誤發其 played）
+  if (btn) { btn.disabled = true; btn.textContent = '載入中…'; }
+
+  var rec = { id: id, bubble: bubble, btn: btn, audio: null, url: null, done: false };
+  rec.cleanup = function() {
+    if (rec.done) return;   // 冪等：ended／onerror／superseded 任一路徑只清一次
+    rec.done = true;
+    if (rec.audio) { rec.audio.onended = null; rec.audio.onerror = null; try { rec.audio.pause(); } catch (e) {} }
+    if (rec.url) { try { URL.revokeObjectURL(rec.url); } catch (e) {} rec.url = null; }
+    if (activePlayback === rec) activePlayback = null;
+  };
+  activePlayback = rec;
+
+  fetch(server + '/voice/reply/' + encodeURIComponent(id) + '/audio', {
+    headers: pinHeaders(), credentials: 'include',
+  }).then(function(res) {
+    if (rec.done) throw new Error('superseded');  // 期間被別筆接管／停掉（rec 已清場）
+    if (!res.ok) throw new Error('audio ' + res.status);
+    return res.blob();
+  }).then(function(blob) {
+    if (rec.done) throw new Error('superseded');
+    rec.url = URL.createObjectURL(blob);
+    var audio = new Audio(rec.url);   // 本筆專屬實例，handlers 綁在它身上
+    rec.audio = audio;
+    audio.onended = function() {
+      // Q2：stale handler 短路——被 superseded 清場（rec.done）後，已排入佇列的 ended
+      // 事件不得再標 played／回報（否則誤發被中斷筆的 played）。
+      if (rec.done) return;
+      // played 只綁真實播放完成：轉已讀樣式，清場後回報（失敗走 O3 重試）。
+      bubble.classList.remove('unread');
+      bubble.dataset.played = '1';
+      var b = rec.btn;
+      rec.cleanup();
+      if (b) { b.disabled = false; b.textContent = '▶ 重播'; }
+      markPlayedAndAck(id);
+    };
+    audio.onerror = function() {
+      if (rec.done) return;   // Q2 對稱防護：清場後的 stale error 事件不再處理
+      rec.cleanup();   // 失敗不發 played，可重播
+      if (btn) { btn.disabled = false; btn.textContent = btnIdle(bubble); }
+    };
+    if (btn) btn.textContent = '播放中…';
+    return audio.play();   // play() reject（無 gesture／iOS 擋）落到下方 catch＝降級（O2）
+  }).catch(function() {
+    // 取檔／play() reject／被接管：不發 played；清場、還原按鈕（可手動重播）。
+    // O2：live autoplay 於無 user gesture 被 reject 時亦走此路＝降級為可手動點播的未讀項。
+    rec.cleanup();
+    if (btn) { btn.disabled = false; btn.textContent = btnIdle(bubble); }
+  });
+}
+
+// 渲染一筆回覆為含重播鈕的 reply 泡泡（live 與補取共用）。autoplay＝live 收 ready
+// 後自動播一次。已渲染者不重建（雙路去重），autoplay 時仍觸發一次播放。
+function renderReply(item, autoplay) {
+  var existing = renderedReplies[item.id];
+  if (existing) {
+    if (autoplay) playReply(item.id, existing, existing.querySelector('.play-btn'));
+    return existing;
+  }
+  var played = item.state === 'played';
+  var d = document.createElement('div');
+  d.className = 'bubble b reply' + (played ? '' : ' unread');
+  d.dataset.id = item.id;
+  if (played) d.dataset.played = '1';
+  var txt = document.createElement('div');
+  txt.textContent = item.summary;          // 文字摘要先行
+  d.appendChild(txt);
+  var btn = document.createElement('button');
+  btn.className = 'play-btn';
+  btn.textContent = played ? '▶ 重播' : '▶ 播放';
+  btn.addEventListener('click', function() { playReply(item.id, d, btn); });
+  d.appendChild(btn);
+  chat.appendChild(d);
+  chat.scrollTop = chat.scrollHeight;
+  renderedReplies[item.id] = d;
+  // 未讀項掛入視窗 read 觀察（成功才記旗標）；已 played 項重開不自動標記、不自動播。
+  if (!played) {
+    if (readObserver) { readObserver.observe(d); }
+    else { sendReadAck(item.id); }
+  }
+  if (autoplay) playReply(item.id, d, btn);
+  return d;
+}
+
+function loadReplies() {
+  // 載入／重開補取：打 /voice/replies 取未讀列表（時間倒序、上限 20）。
+  if (!hasSession && !pin) return;
+  fetch(server + '/voice/replies', { headers: pinHeaders(), credentials: 'include' })
+    .then(function(r) { return r.ok ? r.json() : null; })
+    .then(function(data) {
+      if (!data || !data.replies) return;
+      // 端點回 created_at 倒序（新→舊）；直接按序渲染，UI 亦新→舊（時間倒序契約，
+      // 不再反轉）。已渲染項在此比對 server 態做兩種重試（皆不重播音訊）：
+      //   N4 read——未成功記旗標者重發 read；
+      //   O3 played——UI 已播（playedPending）但匣內仍非 played 者重發 played。
+      for (var i = 0; i < data.replies.length; i++) {
+        var item = data.replies[i];
+        if (renderedReplies[item.id]) {
+          if (item.state !== 'played') {
+            if (!ackedRead[item.id]) sendReadAck(item.id);
+            if (playedPending[item.id]) retryPlayedAck(item.id);
+          } else {
+            delete playedPending[item.id];  // server 已 played，清掉待回報旗標
+          }
+        } else {
+          renderReply(item);
+        }
+      }
+    })
+    .catch(function(){});
+}
+
 // --- PIN validation ---
 function checkStoredPin() {
   if (pin && pin.length === 6) {
@@ -177,6 +388,7 @@ function checkStoredPin() {
         hasSession = true;
         unlockMic();
         initMic();
+        loadReplies();  // 載入即補取未讀列表（票 6-4）
       } else {
         showPinScreen();
       }
@@ -221,6 +433,7 @@ pinInput.addEventListener('input', function() {
         sessionStorage.setItem('meowvoice_pin', pin);
         unlockMic();
         initMic();
+        loadReplies();  // 驗證成功即補取未讀列表（票 6-4）
         msg('s', '驗證成功，按住麥克風說話');
       } else {
         pinErr.textContent = '連線失敗';
@@ -261,6 +474,9 @@ function resetMic() {
 function unlockTtsEl() {
   // Mobile browsers require audio elements to be "blessed" by a user gesture.
   // Play a minimal silent WAV to unlock ttsEl for later programmatic playback.
+  // 6-4 起 reply 播放改用 per-reply new Audio（見 playReply），此儀式僅為 bless 音訊
+  // session（碰共用 ttsEl，不觸碰任何 reply 播放實例）；session 一旦 unlock，後續
+  // new Audio 亦可播。故無需再回 Promise 等它清場。
   ttsEl.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
   ttsEl.play().then(function() { ttsEl.pause(); ttsEl.src = ''; }).catch(function() {});
 }
@@ -453,11 +669,16 @@ document.addEventListener('visibilitychange', function() {
       try { dispatchAbort.abort(); } catch (e) {}
       dispatchAbort = null;
     }
-  } else if (busy && busySince && Date.now() - busySince > 180000) {
-    // 喚醒後 busy 卡超過 3 分鐘＝流程死在鎖屏期間，重置 UI 與麥克風
-    resetMic();
-    done();
-    msg('s', '已重置（鎖屏中斷了上一個流程），請重新按住說話');
+  } else {
+    // 喚醒（重開）即補取未讀列表：鎖屏期間完成的長任務回覆在此補上（票 6-4）。
+    // renderedReplies 去重＝已顯示者不重出，故此呼叫可安全重入。
+    if (hasSession || pin) loadReplies();
+    if (busy && busySince && Date.now() - busySince > 180000) {
+      // 喚醒後 busy 卡超過 3 分鐘＝流程死在鎖屏期間，重置 UI 與麥克風
+      resetMic();
+      done();
+      msg('s', '已重置（鎖屏中斷了上一個流程），請重新按住說話');
+    }
   }
 });
 
@@ -466,24 +687,15 @@ async function pollReply(messageId) {
   for (var i = 0; i < 60; i++) {
     await new Promise(function(r) { setTimeout(r, 2000); });
     try {
-      var res = await fetch(server + '/voice/reply/' + messageId, { headers: pinHeaders(), credentials: 'include' });
-      var data = await res.json();
-      if (data.status === 'ready') {
-        msg('b', data.text);
-        setPhase('語音合成中…');
-        try {
-          var ttsRes = await fetch(server + '/tts', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text: data.text }),
-          });
-          if (ttsRes.ok) {
-            var audioBlob = await ttsRes.blob();
-            ttsEl.src = URL.createObjectURL(audioBlob);
-            ttsEl.play().catch(function(e){ console.error('TTS play blocked:', e); });
-          }
-        } catch (e) {}
+      // 唯讀取文（/text 不改 ACK 態）——與補取收斂到同一渲染／播放路徑：渲染成含
+      // 重播鈕的 reply 泡泡並自動播一次。播放走 audio 端點、played 綁 ended、
+      // 合成／播放失敗不改態可重播（不再走 legacy 取件即 played）。
+      // O4：尚未入匣時 /text 回 404（非 200 pending），續輪詢；入匣後 200 ready 才渲染。
+      var res = await fetch(server + '/voice/reply/' + messageId + '/text', { headers: pinHeaders(), credentials: 'include' });
+      if (res.ok) {
+        var data = await res.json();
         setPhase('');
+        renderReply({ id: messageId, summary: data.text, state: 'delivered' }, true);
         return;
       }
     } catch (e) {}

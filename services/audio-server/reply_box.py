@@ -205,6 +205,30 @@ class ReplyBox:
             self._conn.commit()
             return [r[0] for r in rows]
 
+    def list_recent(
+        self, now: float | None = None, limit: int | None = None
+    ) -> list[tuple[str, str, ReplyState, float]]:
+        """回滾動窗內項目，created_at 倒序（新→舊），供票 6-4 PWA 未讀補取列表。
+
+        唯讀不改任何 ACK 態（read／played ACK 由 PWA 顯式回報，見端點）。先清到期
+        （與其他讀方法一致，僅時間維度物理刪除），再取最新 limit 筆——limit 預設
+        ＝滾動窗上限 max_entries（20），即「與滾動窗同界、一頁不分頁」。SQL 的
+        LIMIT 是即使入匣期未及砍到超窗也絕不回超過一頁的最終防線。
+
+        回 list[(reply_id, text, state, created_at)]，同刻以 reply_id DESC 為穩定
+        次序（與 _trim_over_capacity 的保留排序同鍵，列表與清理視角一致）。"""
+        now = self._clock() if now is None else now
+        cap = self._max_entries if limit is None else limit
+        with self._lock:
+            self._purge_expired(now)
+            rows = self._conn.execute(
+                "SELECT reply_id, text, state, created_at FROM replies"
+                " ORDER BY created_at DESC, reply_id DESC LIMIT ?",
+                (cap,),
+            ).fetchall()
+            self._conn.commit()
+            return [(r[0], r[1], ReplyState(r[2]), r[3]) for r in rows]
+
     def sweep(self, now: float | None = None) -> None:
         """主動全窗清理（清到期＋砍超窗），不依賴匣讀寫流量。
 

@@ -29,7 +29,7 @@ from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse, Fil
 import httpx
 
 from dedup import DedupCache
-from reply_box import ReplyBox
+from reply_box import ReplyBox, ReplyState, AckOutcome
 from reply_cache import ReplyCache, ReplyCacheFull
 from fast_voice import EscalationAliases, FastVoiceEngine, load_persona
 from crispasr_tts import CRISPASR_SAMPLE_RATE, CrispasrSynthError, CrispasrTtsEngine
@@ -1162,6 +1162,27 @@ async def get_reply(request: Request, message_id: str):
     return {"status": "ready", "text": text}
 
 
+@app.get("/voice/reply/{message_id}/text")
+async def get_reply_text(request: Request, message_id: str):
+    """唯讀取回覆全文（票 6-4）——不改任何 ACK 態。
+
+    供新版 PWA 的 live 輪詢（等當下回覆）取文渲染；播放與 played ACK 另走 audio
+    端點＋顯式 /ack，故合成／播放失敗時資料層仍非 played、可重播。與 legacy
+    GET /voice/reply/{id}（取件即自動 ACK 至 played）刻意分離：legacy 保留零改動
+    給舊版已安裝 PWA 相容與回滾路徑，新版 live 不再經它避免「取文即 played」。
+
+    契約（O4）：不存在或已被滾動窗物理刪除的 ID 一律 404。入匣時 text 必與 reply
+    同筆寫入（enqueue(reply_id, text)），不存在「匣中存在但文字未備妥」的場景，故
+    無 pending 語意——live 輪詢尚未入匣時收 404，續輪詢至入匣回 200 或超時。回
+    {status:"ready", text}（不改態）。pin 防護。"""
+    if not _check_pin(request):
+        return JSONResponse({"error": "Invalid PIN"}, status_code=401)
+    entry = _get_reply_box().get(message_id)
+    if entry is None:
+        return JSONResponse({"error": "reply not found"}, status_code=404)
+    return {"status": "ready", "text": entry[0]}
+
+
 @app.get("/voice/reply/{message_id}/audio")
 async def get_reply_audio(request: Request, message_id: str):
     """點播回覆音訊（票 6-3）。
@@ -1217,6 +1238,89 @@ async def get_reply_audio(request: Request, message_id: str):
         logger.warning("點播合成失敗：id=%s err=%r", message_id, e)
         return JSONResponse({"error": "TTS failed"}, status_code=503)
     return StreamingResponse(io.BytesIO(wav), media_type="audio/wav")
+
+
+# 列表文字摘要上限（字元）：未讀列表「文字摘要先行」，長回覆截斷供緊湊預覽，
+# 音訊點播仍用匣內全文合成（audio 端點取 entry[0]），故截斷不損可聽內容。
+REPLY_SUMMARY_MAX_CHARS = int(os.environ.get("MEOWVOICE_REPLY_SUMMARY_MAX", "160"))
+
+# ACK 端點只受理 client 可顯式回報的兩態：read（列表逐筆入視窗）／played（播放
+# 完成）。delivered 是入匣初態、非 client 動作，不在受理集＝送 delivered 也 400。
+_ACK_STATE_NAMES: dict[str, ReplyState] = {
+    "read": ReplyState.READ,
+    "played": ReplyState.PLAYED,
+}
+
+
+def _summarize(text: str) -> str:
+    """列表用文字摘要正規化。
+
+    Before:
+    - "很長的一段回覆……（超過上限）"
+
+    After:
+    - "很長的一段回覆……（截到上限）…"
+
+    短回覆原樣回；逾上限截斷並補刪節號（U+2026）。"""
+    text = text.strip()
+    if len(text) <= REPLY_SUMMARY_MAX_CHARS:
+        return text
+    return text[:REPLY_SUMMARY_MAX_CHARS].rstrip() + "…"
+
+
+@app.get("/voice/replies")
+async def list_replies(request: Request):
+    """未讀補取列表（票 6-4）。
+
+    回匣內項目：id、文字摘要、state、created_at，created_at 倒序（新→舊）、上限
+    一頁 20 筆（＝滾動窗上限，與匣同界、不分頁）。唯讀不改 ACK 態——read ACK 由
+    PWA 逐筆入視窗時經 /voice/reply/{id}/ack 顯式回報。pin 防護。
+
+    state 以字串名（delivered／read／played）回傳，PWA 據此分未讀（非 played）與
+    已播放樣式；已 played 者重開不列入未讀集、仍可手動點播。"""
+    if not _check_pin(request):
+        return JSONResponse({"error": "Invalid PIN"}, status_code=401)
+    items = _get_reply_box().list_recent()
+    return {
+        "replies": [
+            {
+                "id": reply_id,
+                "summary": _summarize(text),
+                "state": state.name.lower(),
+                "created_at": created_at,
+            }
+            for reply_id, text, state, created_at in items
+        ]
+    }
+
+
+class ReplyAckRequest(BaseModel):
+    state: str
+
+
+@app.post("/voice/reply/{message_id}/ack")
+async def ack_reply(request: Request, message_id: str, req: ReplyAckRequest):
+    """顯式 ACK 端點（票 6-4）。
+
+    body {"state": "read"|"played"}，走 reply_box.ack() 的冪等單調語意：
+    亂序低階 ACK 不降級高階態、重複 ACK＝no-op 回成功（皆 200）。read＝列表逐筆
+    入視窗時；played＝播放「完成」事件時（非開始、播放失敗不報，故可重播）。
+
+    狀態碼：200 成功（outcome 標 advanced／unchanged）；400 非法 state（非
+    read／played，含 delivered）；404 id 不存在；401 pin 未帶／驗證失敗。"""
+    if not _check_pin(request):
+        return JSONResponse({"error": "Invalid PIN"}, status_code=401)
+    target = _ACK_STATE_NAMES.get(req.state)
+    if target is None:
+        # 非法值先擋（含 client 不該回報的 delivered），不觸 reply_box。
+        return JSONResponse(
+            {"error": "invalid state", "detail": "state must be 'read' or 'played'"},
+            status_code=400,
+        )
+    outcome = _get_reply_box().ack(message_id, target)
+    if outcome is AckOutcome.NOT_FOUND:
+        return JSONResponse({"error": "reply not found"}, status_code=404)
+    return {"ok": True, "state": req.state, "outcome": outcome.value}
 
 
 class PinAuthRequest(BaseModel):
