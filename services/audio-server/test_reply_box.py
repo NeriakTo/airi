@@ -198,6 +198,14 @@ def test_sweep_purges_without_read_traffic(tmp_path):
     assert deleted == ["r1"]  # sweep 當下即物理刪除
 
 
+def test_active_ids_lists_current_and_excludes_expired(tmp_path):
+    # 票 6-3 startup 孤兒快取比對用：回現匣所有 id，且先清到期不列已逾期者。
+    box = _box(tmp_path, max_entries=100)
+    box.enqueue("old", "t", now=0.0)
+    box.enqueue("new", "t", now=DEFAULT_WINDOW_SECONDS + 100)
+    assert box.active_ids(now=DEFAULT_WINDOW_SECONDS + 100) == ["new"]
+
+
 # --- 清除 hook（供票 6-3 快取檔連動刪除）---
 
 

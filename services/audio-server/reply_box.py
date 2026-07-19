@@ -195,6 +195,16 @@ class ReplyBox:
             self._conn.commit()
             return int(n)
 
+    def active_ids(self, now: float | None = None) -> list[str]:
+        """回目前匣內所有 reply_id（先清到期）。供票 6-3 startup 比對、清除
+        對應 reply 已不在匣的孤兒快取檔。"""
+        now = self._clock() if now is None else now
+        with self._lock:
+            self._purge_expired(now)
+            rows = self._conn.execute("SELECT reply_id FROM replies").fetchall()
+            self._conn.commit()
+            return [r[0] for r in rows]
+
     def sweep(self, now: float | None = None) -> None:
         """主動全窗清理（清到期＋砍超窗），不依賴匣讀寫流量。
 

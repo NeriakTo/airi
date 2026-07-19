@@ -25,11 +25,12 @@ import numpy as np
 import uvicorn
 from fastapi import FastAPI, Request, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
+from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse, FileResponse
 import httpx
 
 from dedup import DedupCache
 from reply_box import ReplyBox
+from reply_cache import ReplyCache, ReplyCacheFull
 from fast_voice import EscalationAliases, FastVoiceEngine, load_persona
 from crispasr_tts import CRISPASR_SAMPLE_RATE, CrispasrSynthError, CrispasrTtsEngine
 
@@ -369,7 +370,10 @@ async def _precache_crispasr() -> None:
     for key, phrase in CACHED_PHRASES.items():
         t0 = time.time()
         try:
-            result = await _crispasr.synth(_http_client, phrase)
+            # J3：取 _tts_lock 逐句合成，與預合成 worker／點播序列化——暖機不與
+            # reply 合成併發搶佔同一常駐引擎（實測併發合成數 >1 會拖慢首音）。
+            async with _tts_lock:
+                result = await _crispasr.synth(_http_client, phrase)
         except Exception as e:
             logger.warning("Failed to pre-cache voice '%s' via crispasr: %s", key, e)
             continue
@@ -413,6 +417,10 @@ async def lifespan(app: FastAPI):
     # 內容不因服務無流量而滯留磁碟（F3）。
     _get_reply_box().sweep()
     _reply_box_sweeper_task = asyncio.create_task(_reply_box_sweeper())
+    # 孤兒快取清理無條件執行（G4）：CrispASR crash 後改以 MLX 回退重啟時，殘留的
+    # .part 半成品／孤兒 .wav 也要清；不預合成不等於不清磁碟。start()（僅 crispasr
+    # 模式）留在下方引擎分支。
+    _get_reply_cache().sweep_orphans(_get_reply_box().active_ids())
     # Backend selection is mutually exclusive: only one TTS engine is warmed.
     if TTS_ENGINE == "crispasr":
         _crispasr = CrispasrTtsEngine(
@@ -425,9 +433,14 @@ async def lifespan(app: FastAPI):
         _t = asyncio.create_task(_precache_crispasr())
         _startup_tasks.add(_t)
         _t.add_done_callback(_startup_tasks.discard)
+        # CrispASR 模式：worker 啟動＋入匣預合成（precache=True）。
+        _get_reply_cache().start(_synthesize_wav_bytes, precache=True)
     else:
         load_tts()
         _generate_cached_voices()
+        # J1：MLX 模式也啟動 worker——點播 miss 一律走統一入口與唯一發布守衛；
+        # precache=False＝維持「不預合成」（入匣不排 job）。
+        _get_reply_cache().start(_synthesize_wav_bytes, precache=False)
     load_stt()
     voice_ok = bool(DISCORD_WEBHOOK and DISCORD_BOT_TOKEN)
     logger.info("Audio server ready on %s:%d (engine=%s, voice_bridge=%s, cached=%d)",
@@ -435,6 +448,7 @@ async def lifespan(app: FastAPI):
     yield
     if _reply_box_sweeper_task is not None:
         _reply_box_sweeper_task.cancel()
+    await _get_reply_cache().stop()  # 取消預合成 worker（未 start 為 no-op）
     await _http_client.aclose()
     logger.info("Audio server shutting down")
 
@@ -557,43 +571,23 @@ async def tts_generate(req: TtsRequest):
 async def _tts_generate_inner(req: TtsRequest):
     if TTS_ENGINE == "crispasr":
         return await _crispasr_generate(req)
-    model = load_tts()
-    text, voice, lang, stream = req.text, req.voice, req.lang, req.stream
-    temperature, speed = req.temperature, req.speed
+    # MLX 生成走共用核心（K3，與 reply worker 同一份、參數完整）；對外仍是完整
+    # WAV／空音訊 500，行為不變。
     t_start = time.time()
-
-    mx.random.seed(req.seed)
-    audio_chunks: list[np.ndarray] = []
-    chunk_count = 0
-    for result in model.generate(
-        text=text,
-        voice=voice,
-        lang_code=lang,
-        verbose=False,
-        stream=stream,
-        temperature=temperature,
-        speed=speed,
-        **({"streaming_interval": 1.0} if stream else {}),
-    ):
-        if hasattr(result, "audio"):
-            audio_chunks.append(np.array(result.audio))
-            chunk_count += 1
-
-    if not audio_chunks:
+    try:
+        wav = _mlx_generate_wav(
+            req.text,
+            voice=req.voice,
+            temperature=req.temperature,
+            speed=req.speed,
+            seed=req.seed,
+            lang=req.lang,
+            stream=req.stream,
+        )
+    except RuntimeError:
         return JSONResponse({"error": "No audio generated"}, status_code=500)
-
-    logger.info("TTS done: text=%r chunks=%d time=%.2fs", text[:30], chunk_count, time.time() - t_start)
-
-    full_audio = np.concatenate(audio_chunks)
-    audio_int16 = (full_audio * 32767).astype(np.int16)
-    buf = io.BytesIO()
-    with wave.open(buf, "w") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(model.sample_rate)
-        wf.writeframes(audio_int16.tobytes())
-    buf.seek(0)
-    return StreamingResponse(buf, media_type="audio/wav")
+    logger.info("TTS done: text=%r bytes=%d time=%.2fs", req.text[:30], len(wav), time.time() - t_start)
+    return StreamingResponse(io.BytesIO(wav), media_type="audio/wav")
 
 
 async def _crispasr_generate(req: TtsRequest):
@@ -1006,14 +1000,103 @@ REPLY_BOX_SWEEP_INTERVAL = float(os.environ.get("MEOWVOICE_REPLY_BOX_SWEEP_INTER
 _reply_box_sweeper_task: asyncio.Task | None = None
 
 
+# 預合成音訊快取（票 6-3）：lazy 單例，同 F5 避免 import 階段碰真實家目錄。
+_reply_cache: ReplyCache | None = None
+# 點播端點的總等待預算（秒，H2）：await 合成 Future 逾時＝回 503＋Retry-After，
+# 絕不開第二次合成（背景 job 續跑，快取完成後下次點播命中）。
+REPLY_AUDIO_BUDGET = float(os.environ.get("MEOWVOICE_REPLY_AUDIO_BUDGET", "3.5"))
+
+
+def _get_reply_cache() -> ReplyCache:
+    """回 lazy 單例預合成快取（首次呼叫才建，讀 MEOWVOICE_REPLY_CACHE_DIR）。"""
+    global _reply_cache
+    if _reply_cache is None:
+        cache_dir = Path(os.environ.get(
+            "MEOWVOICE_REPLY_CACHE_DIR", str(_MEOWVOICE_DIR / "reply_cache")))
+        _reply_cache = ReplyCache(cache_dir)
+    return _reply_cache
+
+
 def _get_reply_box() -> ReplyBox:
-    """回 lazy 單例回覆匣（首次呼叫才建，讀 MEOWVOICE_REPLY_BOX_DB）。"""
+    """回 lazy 單例回覆匣（首次呼叫才建，讀 MEOWVOICE_REPLY_BOX_DB）。
+
+    on_delete 掛到預合成快取的 delete：回覆被清出匣（到期／超窗）時，對應音訊
+    快取檔連動刪除，快取生命週期與回覆匣一致（票 6-3）。"""
     global _reply_box
     if _reply_box is None:
         db_path = Path(os.environ.get(
             "MEOWVOICE_REPLY_BOX_DB", str(_MEOWVOICE_DIR / "reply_box.db")))
-        _reply_box = ReplyBox(db_path)
+        _reply_box = ReplyBox(db_path, on_delete=_get_reply_cache().delete)
     return _reply_box
+
+
+def _mlx_generate_wav(
+    text: str,
+    *,
+    voice: str,
+    temperature: float,
+    speed: float,
+    seed: int,
+    lang: str = "chinese",
+    stream: bool = False,
+) -> bytes:
+    """MLX in-process 生成完整 WAV bytes——/tts 與 reply worker 的共用核心（K3）。
+
+    參數完整傳遞（voice／temperature／speed／seed／lang／stream）以與 /tts 對外
+    行為等價；seed 固定聲線。回完整 WAV bytes，空音訊拋 RuntimeError 供呼叫端映射。
+    為同步 CPU 工作——worker 路徑以 asyncio.to_thread 呼叫、不阻塞事件迴圈（K1）。"""
+    model = load_tts()
+    mx.random.seed(seed)
+    audio_chunks: list[np.ndarray] = []
+    for result in model.generate(
+        text=text,
+        voice=voice,
+        lang_code=lang,
+        verbose=False,
+        stream=stream,
+        temperature=temperature,
+        speed=speed,
+        **({"streaming_interval": 1.0} if stream else {}),
+    ):
+        if hasattr(result, "audio"):
+            audio_chunks.append(np.array(result.audio))
+    if not audio_chunks:
+        raise RuntimeError("MLX 生成無音訊")
+    audio_int16 = (np.concatenate(audio_chunks) * 32767).astype(np.int16)
+    buf = io.BytesIO()
+    with wave.open(buf, "w") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(model.sample_rate)
+        wf.writeframes(audio_int16.tobytes())
+    return buf.getvalue()
+
+
+async def _synthesize_wav_bytes(text: str) -> bytes:
+    """合成回覆全文為完整 WAV bytes——worker 的引擎無關合成 callable（J1）。
+
+    依當前 TTS 引擎分派：CrispASR 走常駐服務、MLX 走 in-process 生成。序列化於
+    _tts_lock 之下：兩引擎皆為單一資源，預合成／點播不與即時 /tts 併發搶佔。"""
+    async with _tts_lock:
+        if TTS_ENGINE != "crispasr":
+            # K1：MLX 為同步 CPU 生成，移出事件迴圈（to_thread），否則整個迴圈——
+            # health／其他端點／REPLY_AUDIO_BUDGET 計時器——全部停擺。_tts_lock 為
+            # asyncio.Lock，跨 await 持有正常。
+            return await asyncio.to_thread(
+                _mlx_generate_wav,
+                text,
+                voice=TTS_VOICE,
+                temperature=TTS_TEMPERATURE,
+                speed=TTS_SPEED,
+                seed=TTS_SEED,
+            )
+        if _crispasr is None:
+            raise CrispasrSynthError("crispasr engine not active")
+        # 進鎖後複查斷路器：排隊期間可能已跳閘，不讓 queued 請求再打死引擎。
+        if _crispasr.is_unhealthy():
+            raise CrispasrSynthError("circuit breaker open")
+        result = await _crispasr.synth(_http_client, text)
+    return _crispasr.pcm_to_wav(result.pcm)
 
 
 async def _reply_box_sweeper() -> None:
@@ -1053,6 +1136,11 @@ async def voice_reply_callback(request: Request, req: VoiceReplyCallback):
     if not _get_reply_box().enqueue(store_id, req.text):
         return {"ok": False, "duplicate": True, "runtime": source}
 
+    # 入匣成功即非同步觸發預合成（票 6-3）：快取盡力、不阻塞回覆——佇列滿載或
+    # worker 未啟（MLX 模式）皆只跳過，回覆已落匣不受影響。await 僅為入列（notify
+    # worker），不等合成。
+    await _get_reply_cache().enqueue(store_id, req.text)
+
     if DISCORD_WEBHOOK:
         asyncio.create_task(_discord_post_webhook(f"🫧 {req.text}", f"青喵 (語音回覆/{source})"))
 
@@ -1072,6 +1160,63 @@ async def get_reply(request: Request, message_id: str):
     if text is None:
         return {"status": "pending"}
     return {"status": "ready", "text": text}
+
+
+@app.get("/voice/reply/{message_id}/audio")
+async def get_reply_audio(request: Request, message_id: str):
+    """點播回覆音訊（票 6-3）。
+
+    命中預合成快取＝直接回檔（首音 <1s）；miss＝併入同一合成 job 等其結果
+    （H1，端點不直接呼叫引擎）。不改 ACK 狀態——播放完成的 played ACK 屬票 6-4。
+
+    狀態碼：200 音訊；404 reply 不存在／已到期；410 等待期間 reply 被刪；
+    503＋Retry-After 逾時或引擎不可用（PWA 輪詢重試，背景 job 完成後命中）。"""
+    if not _check_pin(request):
+        return JSONResponse({"error": "Invalid PIN"}, status_code=401)
+    # G1：先驗匣內有效再回音訊——已刪／到期一律 404，不回可能被背景 job 復活的快取。
+    entry = _get_reply_box().get(message_id)
+    if entry is None:
+        return JSONResponse({"error": "reply not found"}, status_code=404)
+
+    cache = _get_reply_cache()
+    ready = cache.path_if_ready(message_id)
+    if ready is not None:
+        return FileResponse(ready, media_type="audio/wav")
+
+    # H1/J1：合成一律經快取單一入口（點播高優先）、worker 依引擎分派（CrispASR／
+    # MLX 皆然，端點不直呼引擎）；撞進行中的 job 回同一 Future 不重複做工。shield
+    # 讓「等待逾時」只取消本次等待、不取消背景 job 的 Future。
+    fut = await cache.get_or_join(message_id, entry[0], playback=True)
+    waiter = asyncio.ensure_future(asyncio.shield(fut))
+    try:
+        done, _pending = await asyncio.wait({waiter}, timeout=REPLY_AUDIO_BUDGET)
+    except asyncio.CancelledError:
+        waiter.cancel()  # 本請求 task 被取消（client 斷線），清理後正常傳播（H3）
+        raise
+    if not done:
+        # H2：逾時＝503＋Retry-After，絕不開第二次合成——背景 job 續跑，下次命中。
+        waiter.cancel()
+        return JSONResponse(
+            {"error": "synthesis in progress", "detail": "retry shortly"},
+            status_code=503, headers={"Retry-After": "1"})
+    try:
+        wav = waiter.result()
+    except asyncio.CancelledError:
+        # H3：Future 被取消——僅可能因 reply 於等待期間被刪（delete→fut.cancel）。
+        # 回 410 與既有「已刪 ID」語意一致，不讓 CancelledError 洩漏成連線層錯誤。
+        if fut.cancelled():
+            return JSONResponse({"error": "reply deleted"}, status_code=410)
+        raise
+    except ReplyCacheFull:
+        return JSONResponse(
+            {"error": "synthesis queue full", "detail": "retry shortly"},
+            status_code=503, headers={"Retry-After": "1"})
+    except CrispasrSynthError as e:
+        return JSONResponse({"error": "TTS engine unavailable", "detail": str(e)}, status_code=503)
+    except Exception as e:
+        logger.warning("點播合成失敗：id=%s err=%r", message_id, e)
+        return JSONResponse({"error": "TTS failed"}, status_code=503)
+    return StreamingResponse(io.BytesIO(wav), media_type="audio/wav")
 
 
 class PinAuthRequest(BaseModel):
