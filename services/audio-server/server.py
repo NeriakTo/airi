@@ -30,6 +30,7 @@ import httpx
 
 from dedup import DedupCache
 from fast_voice import EscalationAliases, FastVoiceEngine, load_persona
+from crispasr_tts import CRISPASR_SAMPLE_RATE, CrispasrSynthError, CrispasrTtsEngine
 
 logger = logging.getLogger("meowvoice-audio")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -61,6 +62,46 @@ STT_MODEL_ID = os.environ.get(
 TTS_VOICE = os.environ.get("MEOWVOICE_TTS_VOICE", "Chelsie")
 HOST = os.environ.get("MEOWVOICE_HOST", "127.0.0.1")
 PORT = int(os.environ.get("MEOWVOICE_PORT", "8400"))
+
+# --- TTS engine selection (ticket 6-1) ---
+# Active TTS backend: "crispasr" (resident C++ ggml server, launchd
+# dev.nerigate.meowvoice.crispasr) or "mlx" (in-process Qwen3-TTS). One-flip
+# rollback lives in ~/.meowvoice/tts.json; MEOWVOICE_TTS_ENGINE overrides it
+# (tests/CI). Default stays "mlx" so nothing switches until the flip is written.
+# INVARIANT: the two engines never load together — in "crispasr" mode the MLX
+# model is never loaded into this process (see lifespan / load_tts gating).
+_TTS_ENGINE_CONFIG = Path(os.environ.get(
+    "MEOWVOICE_TTS_CONFIG", str(Path.home() / ".meowvoice" / "tts.json")))
+
+
+def _resolve_tts_engine() -> str:
+    env = os.environ.get("MEOWVOICE_TTS_ENGINE", "").strip().lower()
+    if env in ("crispasr", "mlx"):
+        return env
+    if _TTS_ENGINE_CONFIG.exists():
+        try:
+            engine = json.loads(_TTS_ENGINE_CONFIG.read_text()).get("engine", "").strip().lower()
+            if engine in ("crispasr", "mlx"):
+                return engine
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning("TTS engine config unreadable (%s), defaulting to mlx", e)
+    return "mlx"
+
+
+TTS_ENGINE = _resolve_tts_engine()
+CRISPASR_URL = os.environ.get(
+    "MEOWVOICE_CRISPASR_URL", "http://127.0.0.1:8123/v1/audio/speech")
+CRISPASR_VOICE = os.environ.get("MEOWVOICE_CRISPASR_VOICE", "serena")
+CRISPASR_CONSENT = os.environ.get(
+    "MEOWVOICE_CRISPASR_CONSENT", "Self-owned production voice reference (Kevin).")
+# Failure-containment budgets (ticket 6-1 R1 / C1). Per-sentence timeout kept
+# small so a deaf upstream cannot wedge the shared TTS lock; the whole-utterance
+# deadline caps total lock-hold; the breaker fails new requests fast for its TTL.
+CRISPASR_TIMEOUT = float(os.environ.get("MEOWVOICE_CRISPASR_TIMEOUT", "10"))
+CRISPASR_RETRIES = int(os.environ.get("MEOWVOICE_CRISPASR_RETRIES", "1"))
+CRISPASR_BACKOFF = float(os.environ.get("MEOWVOICE_CRISPASR_BACKOFF", "2"))
+CRISPASR_DEADLINE = float(os.environ.get("MEOWVOICE_CRISPASR_DEADLINE", "30"))
+CRISPASR_BREAKER_TTL = float(os.environ.get("MEOWVOICE_CRISPASR_BREAKER_TTL", "30"))
 
 DISCORD_WEBHOOK = os.environ.get("MEOWVOICE_DISCORD_WEBHOOK", "")
 VOICE_CHANNEL_ID = os.environ.get("MEOWVOICE_VOICE_CHANNEL_ID", "1475645959542145166")
@@ -277,9 +318,26 @@ _tts_lock = asyncio.Lock()
 _stt_lock = asyncio.Lock()
 _http_client: httpx.AsyncClient | None = None
 
+# CrispASR adapter is created only in "crispasr" mode; stays None under MLX so
+# the two backends never coexist in this process.
+_crispasr: CrispasrTtsEngine | None = None
+# Holds background startup tasks (precache) so they are not GC'd mid-flight.
+_startup_tasks: set[asyncio.Task] = set()
+# Cached CrispASR liveness for /health, refreshed at most every 5s (C1/H2) so a
+# health-poll storm cannot hammer the upstream. ts is monotonic seconds.
+_crispasr_health: dict[str, float | bool] = {"ts": 0.0, "ok": False}
+# Serialises concurrent cold probes (single-flight, R3 H2): only one probe runs,
+# the rest wait and read its fresh result — so no out-of-order stale overwrite.
+_crispasr_probe_lock = asyncio.Lock()
+
 
 def load_tts():
     global tts_model
+    # Mutual-exclusion guard: in crispasr mode the MLX model must never load
+    # into this process (memory + ticket 6-1 §5 invariant). Callers on the
+    # crispasr path go through _crispasr instead.
+    if TTS_ENGINE != "mlx":
+        raise RuntimeError(f"load_tts() called under TTS_ENGINE={TTS_ENGINE}; MLX must not load")
     if tts_model is not None:
         return tts_model
     logger.info("Loading TTS model: %s", TTS_MODEL_ID)
@@ -305,8 +363,21 @@ CACHED_PHRASES: dict[str, str] = {
 _voice_cache: dict[str, bytes] = {}
 
 
+async def _precache_crispasr() -> None:
+    """Pre-generate standard feedback phrases via the resident CrispASR server."""
+    for key, phrase in CACHED_PHRASES.items():
+        t0 = time.time()
+        try:
+            result = await _crispasr.synth(_http_client, phrase)
+        except Exception as e:
+            logger.warning("Failed to pre-cache voice '%s' via crispasr: %s", key, e)
+            continue
+        _voice_cache[key] = _crispasr.pcm_to_wav(result.pcm)
+        logger.info("Cached voice '%s' (crispasr): %d bytes, %.1fs", key, len(_voice_cache[key]), time.time() - t0)
+
+
 def _generate_cached_voices() -> None:
-    """Pre-generate standard voice feedback phrases at startup."""
+    """Pre-generate standard voice feedback phrases at startup (MLX path)."""
     model = load_tts()
     for key, phrase in CACHED_PHRASES.items():
         t0 = time.time()
@@ -334,14 +405,28 @@ def _generate_cached_voices() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _http_client
+    global _http_client, _crispasr
     _http_client = httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0))
     _init_pin_storage()
-    load_tts()
+    # Backend selection is mutually exclusive: only one TTS engine is warmed.
+    if TTS_ENGINE == "crispasr":
+        _crispasr = CrispasrTtsEngine(
+            CRISPASR_URL, CRISPASR_VOICE, CRISPASR_CONSENT,
+            timeout=CRISPASR_TIMEOUT, retries=CRISPASR_RETRIES, backoff=CRISPASR_BACKOFF,
+            deadline=CRISPASR_DEADLINE, breaker_ttl=CRISPASR_BREAKER_TTL)
+        logger.info("TTS engine=crispasr url=%s voice=%s (MLX not loaded)", CRISPASR_URL, CRISPASR_VOICE)
+        # Precache is best-effort and OFF the readiness path: a slow/dead upstream
+        # must not delay 'ready' (C1 ④). Runs in the background; failures are logged.
+        _t = asyncio.create_task(_precache_crispasr())
+        _startup_tasks.add(_t)
+        _t.add_done_callback(_startup_tasks.discard)
+    else:
+        load_tts()
+        _generate_cached_voices()
     load_stt()
-    _generate_cached_voices()
     voice_ok = bool(DISCORD_WEBHOOK and DISCORD_BOT_TOKEN)
-    logger.info("Audio server ready on %s:%d (voice_bridge=%s, cached=%d)", HOST, PORT, voice_ok, len(_voice_cache))
+    logger.info("Audio server ready on %s:%d (engine=%s, voice_bridge=%s, cached=%d)",
+                HOST, PORT, TTS_ENGINE, voice_ok, len(_voice_cache))
     yield
     await _http_client.aclose()
     logger.info("Audio server shutting down")
@@ -362,12 +447,62 @@ SSL_KEY = os.environ.get("MEOWVOICE_SSL_KEY", "/tmp/meowvoice-key.pem")
 TEST_PAGE = Path(__file__).parent / "test-page.html"
 
 
+async def _probe_crispasr() -> bool:
+    """Liveness of the resident CrispASR server, cached for 5s (H2).
+
+    A GET :8123/health is cheap but /health can be polled hard, so the result is
+    memoised for 5s. Any transport error or non-200 marks the upstream down.
+    """
+    now = time.monotonic()
+    # 0.0 <= age < 5.0: a fresh cache short-circuits, but a "future" ts (age < 0)
+    # is not treated as fresh — it must fall through so the monotonic guard runs.
+    if 0.0 <= now - float(_crispasr_health["ts"]) < 5.0:
+        return bool(_crispasr_health["ok"])
+    # Single-flight (R3 H2): serialise concurrent cold probes so only one hits
+    # the upstream; waiters re-check the now-fresh cache instead of racing.
+    async with _crispasr_probe_lock:
+        started = time.monotonic()
+        if 0.0 <= started - float(_crispasr_health["ts"]) < 5.0:
+            return bool(_crispasr_health["ok"])  # another waiter just refreshed it
+        ok = False
+        if _http_client is not None:
+            base = CRISPASR_URL.split("/v1/", 1)[0]  # http://127.0.0.1:8123
+            try:
+                resp = await _http_client.get(f"{base}/health", timeout=2.0)
+                ok = resp.status_code == 200
+            except Exception:
+                ok = False
+        # Monotonic guard: an older probe must not overwrite a newer cached result.
+        # If a newer result already won (started < stored ts), return THAT value so
+        # every reader at this instant agrees on the latest result (R4 H2).
+        if started >= float(_crispasr_health["ts"]):
+            _crispasr_health.update(ts=started, ok=ok)
+            return ok
+        return bool(_crispasr_health["ok"])
+
+
 @app.get("/health")
 async def health():
+    if TTS_ENGINE == "crispasr":
+        # crispasr_ready reflects a live upstream probe, not just adapter presence:
+        # an upstream 503 must surface as status=degraded (H2), not a false "ok".
+        ready = _crispasr is not None and await _probe_crispasr()
+        return {
+            "status": "ok" if ready else "degraded",
+            "tts_engine": TTS_ENGINE,
+            "tts_model": CRISPASR_URL,
+            # false here is the mutual-exclusion witness: no MLX weights in-process
+            "tts_loaded": tts_model is not None,
+            "crispasr_ready": ready,
+            "stt_model": STT_MODEL_ID,
+            "tts_sample_rate": CRISPASR_SAMPLE_RATE,
+        }
     return {
         "status": "ok",
+        "tts_engine": TTS_ENGINE,
         "tts_model": TTS_MODEL_ID,
         "tts_loaded": tts_model is not None,
+        "crispasr_ready": None,
         "stt_model": STT_MODEL_ID,
         "tts_sample_rate": tts_model.sample_rate if tts_model else None,
     }
@@ -392,11 +527,29 @@ class TtsRequest(BaseModel):
 @app.post("/tts")
 async def tts_generate(req: TtsRequest):
     """Generate speech from text. Returns WAV audio."""
+    # Breaker check is BEFORE the lock (C1 ③): while the upstream is tripped,
+    # new requests fail-fast with 503 instead of queuing behind the dead engine
+    # and holding _tts_lock for the whole deadline.
+    if TTS_ENGINE == "crispasr" and _crispasr is not None and _crispasr.is_unhealthy():
+        return JSONResponse(
+            {"error": "TTS engine unavailable", "detail": "circuit breaker open"},
+            status_code=503,
+        )
     async with _tts_lock:
+        # Double-check under the lock (R3 C1): the breaker may have tripped while
+        # this request was queued for _tts_lock. A queued request must not still
+        # hit a dead upstream — release the lock and 503 instead.
+        if TTS_ENGINE == "crispasr" and _crispasr is not None and _crispasr.is_unhealthy():
+            return JSONResponse(
+                {"error": "TTS engine unavailable", "detail": "circuit breaker open"},
+                status_code=503,
+            )
         return await _tts_generate_inner(req)
 
 
 async def _tts_generate_inner(req: TtsRequest):
+    if TTS_ENGINE == "crispasr":
+        return await _crispasr_generate(req)
     model = load_tts()
     text, voice, lang, stream = req.text, req.voice, req.lang, req.stream
     temperature, speed = req.temperature, req.speed
@@ -434,6 +587,33 @@ async def _tts_generate_inner(req: TtsRequest):
         wf.writeframes(audio_int16.tobytes())
     buf.seek(0)
     return StreamingResponse(buf, media_type="audio/wav")
+
+
+async def _crispasr_generate(req: TtsRequest):
+    """/tts via the resident CrispASR server with sentence-level segmentation.
+
+    Delegates ordering + skip-and-continue recovery to CrispasrTtsEngine.synth
+    (ticket 6-1 §2); a degraded (some sentences dropped) result still returns
+    audio, only fully-failed synthesis becomes a 500.
+    """
+    t_start = time.time()
+    try:
+        # voice is fixed to the vendored serena clone; req.voice (an MLX speaker
+        # name) does not map onto the CrispASR voice-dir, so it is ignored here.
+        result = await _crispasr.synth(_http_client, req.text)
+    except CrispasrSynthError as e:
+        # Upstream dead / deadline / breaker => 503 (service unavailable), the
+        # honest signal for a resident dependency being down.
+        logger.warning("CrispASR TTS failed: text=%r err=%s", req.text[:30], e)
+        return JSONResponse({"error": "TTS engine unavailable", "detail": str(e)}, status_code=503)
+
+    if result.degraded:
+        logger.warning("CrispASR TTS degraded: %d/%d sentence(s) dropped (idx=%s) text=%r",
+                       len(result.failed), len(result.sentences), result.failed, req.text[:30])
+    logger.info("TTS done [crispasr]: text=%r sentences=%d bytes=%d time=%.2fs",
+                req.text[:30], len(result.sentences), len(result.pcm), time.time() - t_start)
+    wav = _crispasr.pcm_to_wav(result.pcm)
+    return StreamingResponse(io.BytesIO(wav), media_type="audio/wav")
 
 
 @app.post("/stt")
