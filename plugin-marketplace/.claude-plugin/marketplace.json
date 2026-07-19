@@ -1,0 +1,19 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "meowvoice-local",
+  "metadata": {
+    "description": "Local marketplace for the MeowVoice voice channel plugin (Ticket 1-10 語音根治)."
+  },
+  "owner": {
+    "name": "NeriakTo",
+    "email": "neriak1219@gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "meowvoice",
+      "source": "./meowvoice",
+      "description": "MeowVoice voice channel — STT text injection via HTTP with PIN auth; voice_reply TTS bridge to audio-server on 127.0.0.1:8400.",
+      "category": "productivity"
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "meowvoice": {
+      "command": "bun",
+      "args": [
+        "run",
+        "--cwd",
+        "${CLAUDE_PLUGIN_ROOT}",
+        "--shell=bun",
+        "--silent",
+        "start"
+      ],
+      "env": {
+        "MEOWVOICE_PLUGIN_PORT": "8401",
+        "MEOWVOICE_AUDIO_SERVER": "http://127.0.0.1:8400"
+      }
+    }
+  }
+}

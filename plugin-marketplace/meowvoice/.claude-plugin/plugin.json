@@ -1,0 +1,19 @@
+{
+  "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
+  "name": "meowvoice",
+  "version": "0.1.0",
+  "description": "MeowVoice voice channel — STT text injection via HTTP with PIN auth",
+  "author": {
+    "name": "NeriakTo",
+    "email": "neriak1219@gmail.com"
+  },
+  "skills": [
+    "./"
+  ],
+  "channels": [
+    {
+      "server": "meowvoice",
+      "displayName": "meowvoice"
+    }
+  ]
+}
