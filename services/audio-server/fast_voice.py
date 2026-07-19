@@ -200,9 +200,17 @@ class EscalationAliases:
         self._aliases[bridge_id] = (original_id, now)
 
     def resolve(self, message_id: str, now: float | None = None) -> str:
-        """有別名回原始 id（一次性），沒有就原樣回傳。"""
+        """TTL 內回原始 id（可重複解析、不消耗），到期或無別名回原樣。
+
+        可重複解析（peek 而非 pop）是防雙投的必要條件：同一 bridge callback 若
+        被重送，兩次都須解析成同一穩定原始 id，回覆匣的撞 ID 守衛才擋得住重複
+        入匣；若一次性 pop，第二次會退回 bridge id、以不同 store_id 再入匣而繞過
+        守衛（F2）。到期別名於此懶清。"""
         now = time.time() if now is None else now
-        hit = self._aliases.pop(message_id, None)
-        if hit is None or now - hit[1] > self._ttl:
+        hit = self._aliases.get(message_id)
+        if hit is None:
+            return message_id
+        if now - hit[1] > self._ttl:
+            del self._aliases[message_id]  # 到期懶清
             return message_id
         return hit[0]

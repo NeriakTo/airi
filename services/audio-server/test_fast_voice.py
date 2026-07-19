@@ -183,12 +183,15 @@ def test_message_id_prefix_and_uniqueness():
 
 # --- EscalationAliases ---
 
-def test_alias_resolve_swaps_once():
+def test_alias_resolve_repeatable_within_ttl():
+    # F2 回歸：resolve 由一次性 pop 改為 TTL 內可重複解析（peek）。原行為下
+    # 同一 bridge callback 重送時，第二次退回 bridge id、以不同 store_id 再入匣、
+    # 繞過回覆匣撞 ID 守衛而雙投。修後 TTL 內每次解析都回同一穩定原始 id。
     a = EscalationAliases(ttl=300)
     a.register("voice-999-1", "fastvoice-111-1", now=0.0)
     assert a.resolve("voice-999-1", now=10.0) == "fastvoice-111-1"
-    # 一次性：再查同 id 已不換
-    assert a.resolve("voice-999-1", now=11.0) == "voice-999-1"
+    # 重送：TTL 內再解析同 id 仍回原始 id（穩定，防雙投的必要條件）
+    assert a.resolve("voice-999-1", now=11.0) == "fastvoice-111-1"
 
 
 def test_alias_unknown_id_passthrough():

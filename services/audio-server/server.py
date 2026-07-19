@@ -29,6 +29,7 @@ from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 import httpx
 
 from dedup import DedupCache
+from reply_box import ReplyBox
 from fast_voice import EscalationAliases, FastVoiceEngine, load_persona
 from crispasr_tts import CRISPASR_SAMPLE_RATE, CrispasrSynthError, CrispasrTtsEngine
 
@@ -405,9 +406,13 @@ def _generate_cached_voices() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _http_client, _crispasr
+    global _http_client, _crispasr, _reply_box_sweeper_task
     _http_client = httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0))
     _init_pin_storage()
+    # 回覆匣：啟動即清一次（涵蓋停機 >24h 後重啟），再掛週期清理，讓逾期敏感
+    # 內容不因服務無流量而滯留磁碟（F3）。
+    _get_reply_box().sweep()
+    _reply_box_sweeper_task = asyncio.create_task(_reply_box_sweeper())
     # Backend selection is mutually exclusive: only one TTS engine is warmed.
     if TTS_ENGINE == "crispasr":
         _crispasr = CrispasrTtsEngine(
@@ -428,6 +433,8 @@ async def lifespan(app: FastAPI):
     logger.info("Audio server ready on %s:%d (engine=%s, voice_bridge=%s, cached=%d)",
                 HOST, PORT, TTS_ENGINE, voice_ok, len(_voice_cache))
     yield
+    if _reply_box_sweeper_task is not None:
+        _reply_box_sweeper_task.cancel()
     await _http_client.aclose()
     logger.info("Audio server shutting down")
 
@@ -986,12 +993,45 @@ class VoiceReplyCallback(BaseModel):
     runtime_id: str = ""
 
 
-_pending_replies: dict[str, tuple[str, float]] = {}
+# 持久化回覆匣（票 6-2）：取代舊 _pending_replies 記憶體暫存。SQLite 落地、
+# 24h/最近 20 筆滾動窗、ACK 三態（delivered→read→played）；server 重啟以此檔為
+# 真相復原。
+#
+# lazy 單例（F5）：import 階段不建 DB，避免測試在 monkeypatch 前先碰真實家目錄。
+# 首次使用（或啟動清理）才依 MEOWVOICE_REPLY_BOX_DB（預設 ~/.meowvoice/reply_box.db）
+# 建立；測試可先設 env 或直接注入 server._reply_box。
+_reply_box: ReplyBox | None = None
+# 週期主動清理間隔（秒）：服務無流量時仍定時汰除逾期敏感內容（F3）。
+REPLY_BOX_SWEEP_INTERVAL = float(os.environ.get("MEOWVOICE_REPLY_BOX_SWEEP_INTERVAL", "3600"))
+_reply_box_sweeper_task: asyncio.Task | None = None
+
+
+def _get_reply_box() -> ReplyBox:
+    """回 lazy 單例回覆匣（首次呼叫才建，讀 MEOWVOICE_REPLY_BOX_DB）。"""
+    global _reply_box
+    if _reply_box is None:
+        db_path = Path(os.environ.get(
+            "MEOWVOICE_REPLY_BOX_DB", str(_MEOWVOICE_DIR / "reply_box.db")))
+        _reply_box = ReplyBox(db_path)
+    return _reply_box
+
+
+async def _reply_box_sweeper() -> None:
+    """週期喚醒回覆匣主動清理（見 ReplyBox.sweep）。由 lifespan 啟停，
+    取消時吞 CancelledError 前先 re-raise 讓事件迴圈正常收束。"""
+    while True:
+        try:
+            await asyncio.sleep(REPLY_BOX_SWEEP_INTERVAL)
+            _get_reply_box().sweep()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("reply-box 週期清理失敗：%s", e)
 
 
 @app.post("/voice/reply-callback")
 async def voice_reply_callback(request: Request, req: VoiceReplyCallback):
-    """Receive reply from any runtime adapter, store for PWA pickup."""
+    """Receive reply from any runtime adapter, persist to reply box for PWA pickup."""
     if not _check_pin(request):
         return JSONResponse({"error": "Invalid PIN"}, status_code=401)
     if not req.text.strip():
@@ -1000,14 +1040,18 @@ async def voice_reply_callback(request: Request, req: VoiceReplyCallback):
     source = req.runtime_id or "claude-code"
     logger.info("Voice reply [%s]: text=%r", source, req.text[:60])
 
-    if req.message_id:
-        # 升級轉送的回覆帶的是 bridge 自鑄 id，換回 PWA 輪詢的原始 id
-        store_id = _escalation_aliases.resolve(req.message_id)
-        _pending_replies[store_id] = (req.text, time.time())
-        # evict old entries (>5 min)
-        cutoff = time.time() - 300
-        for k in [k for k, v in _pending_replies.items() if v[1] < cutoff]:
-            del _pending_replies[k]
+    # 空 message_id 無法入匣取件，fail-loud 拒絕而非回 200 靜默吞（F4）。生產各
+    # 回投路徑都帶 message_id（fast-voice next_message_id／bridge 自鑄 id）。
+    if not req.message_id:
+        logger.warning("Voice reply 缺 message_id，拒絕入匣：runtime=%s", source)
+        return JSONResponse({"error": "message_id required"}, status_code=400)
+
+    # 升級轉送的回覆帶 bridge 自鑄 id，換回 PWA 輪詢的原始 id 再入匣。
+    store_id = _escalation_aliases.resolve(req.message_id)
+    # Discord 與語音端共用同一 reply ID：撞 ID＝重複投遞，入匣擋下、也不重複發
+    # Discord 保底（防雙投）。
+    if not _get_reply_box().enqueue(store_id, req.text):
+        return {"ok": False, "duplicate": True, "runtime": source}
 
     if DISCORD_WEBHOOK:
         asyncio.create_task(_discord_post_webhook(f"🫧 {req.text}", f"青喵 (語音回覆/{source})"))
@@ -1017,13 +1061,17 @@ async def voice_reply_callback(request: Request, req: VoiceReplyCallback):
 
 @app.get("/voice/reply/{message_id}")
 async def get_reply(request: Request, message_id: str):
-    """Poll for a voice reply by message_id. Returns text when ready."""
+    """Poll for a voice reply by message_id.
+
+    過渡相容：現行 iOS PWA 不發 ACK，故取件即自動 ACK 至 played（等效昔日 pop
+    語意，防重播風暴）；已 played 者回 pending，不重播。顯式 ACK 端點與未讀列表
+    留給票 6-4。"""
     if not _check_pin(request):
         return JSONResponse({"error": "Invalid PIN"}, status_code=401)
-    entry = _pending_replies.pop(message_id, None)
-    if entry is None:
+    text = _get_reply_box().claim_for_playback(message_id)
+    if text is None:
         return {"status": "pending"}
-    return {"status": "ready", "text": entry[0]}
+    return {"status": "ready", "text": text}
 
 
 class PinAuthRequest(BaseModel):
